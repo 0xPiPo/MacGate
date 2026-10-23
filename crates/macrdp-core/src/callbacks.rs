@@ -40,6 +40,22 @@ pub struct Metrics {
     pub network_quality: f32,
     /// Number of GFX frames awaiting ACK from the client
     pub pending_acks: u32,
+    /// RemoteFX sessions: the quality in effect ("low", "medium", "high"), auto mode's
+    /// current level included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfx_quality: Option<String>,
+    /// Session details for the host app; not part of the metrics JSON.
+    /// Client-chosen computer name (GCC clientName), control characters removed.
+    #[serde(skip)]
+    pub client_name: Option<String>,
+    /// Session desktop size.
+    #[serde(skip)]
+    pub width: u16,
+    #[serde(skip)]
+    pub height: u16,
+    /// "avc420" or "rfx-progressive" once GFX caps are confirmed.
+    #[serde(skip)]
+    pub codec: Option<String>,
 }
 
 /// Connection event
@@ -95,7 +111,14 @@ pub enum ConfigUpdate {
     Resolution(String),
     Encoder(String),
     ChromaMode(String),
-    Credentials { username: String, password: String },
+    /// RemoteFX quality: "auto", "low", "medium" or "high"; applies from the next frame.
+    RfxQuality(String),
+    /// Display mode: "curtain", "mirror" or "extend"; applies to the next connection.
+    DisplayMode(String),
+    /// Curtain monitors honour DDC standby; applies to the next connection.
+    CurtainStandbyOk(bool),
+    /// Curtain re-sends standby every 5 s; applies to the next connection.
+    CurtainStandbyKeepalive(bool),
 }
 
 /// Callback trait for receiving server events.
@@ -105,4 +128,7 @@ pub trait ServerEventHandler: Send + Sync + 'static {
     fn on_metrics(&self, _metrics: Metrics) {}
     fn on_connection(&self, _event: ConnectionEvent) {}
     fn on_log(&self, _entry: LogEntry) {}
+    /// Curtain: the physical displays (CGDirectDisplayIDs) the host app must cover with black
+    /// windows; empty once the curtain is gone. Sent whenever the set changes.
+    fn on_shield_displays(&self, _displays: Vec<u32>) {}
 }
