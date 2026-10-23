@@ -2,6 +2,8 @@
 
 <h1 align="center">MacGate</h1>
 
+<p align="center"><a href="https://github.com/0xPiPo/MacGate/actions/workflows/ci.yml"><img src="https://github.com/0xPiPo/MacGate/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+
 <p align="center"><b>A real RDP server for macOS.</b> Reach your Mac from your phone or PC with the free
 Microsoft Remote Desktop / Windows App. Log in with your Mac account; the session is sized to
 your device, and nobody at the desk can watch.</p>
