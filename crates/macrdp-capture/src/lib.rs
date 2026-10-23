@@ -1,5 +1,9 @@
 //! macOS screen capture via ScreenCaptureKit
 
+pub mod ddc;
+pub mod virtual_display;
+mod windows;
+
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -23,6 +27,15 @@ pub fn request_screen_recording_permission() -> bool {
     ScreenCaptureAccess::default().request()
 }
 
+/// ScreenCaptureKit without Screen Recording access shows the system prompt: callers that must
+/// not prompt (server start) get an error instead.
+fn ensure_screen_access() -> Result<()> {
+    if !check_screen_recording_permission() {
+        anyhow::bail!("Screen Recording not granted");
+    }
+    Ok(())
+}
+
 /// Open System Settings to Privacy & Security page
 pub fn open_screen_recording_settings() {
     let _ = std::process::Command::new("open")
@@ -31,7 +44,7 @@ pub fn open_screen_recording_settings() {
 }
 
 /// A rectangle region
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
@@ -46,6 +59,8 @@ pub enum CapturePixelFormat {
     Bgra,
     /// NV12 (420f full-range) — zero-copy to VideoToolbox, no color conversion needed
     Nv12,
+    /// BGRA delivered as the retained CVPixelBuffer (no copy): readers copy only what they need
+    BgraBuffer,
 }
 
 /// Frame pixel data — either raw BGRA bytes or a zero-copy CVPixelBuffer reference
@@ -109,12 +124,51 @@ pub struct CaptureConfig {
     pub frame_rate: u32,
     pub pixel_format: CapturePixelFormat,
     pub show_cursor: bool,
+    /// Display to capture (CGDirectDisplayID); None = the first shareable display.
+    pub display_id: Option<u32>,
 }
 
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
     stream: SCStream,
     frame_rx: mpsc::Receiver<CaptureEvent>,
+    /// Raised by the stream delegate when ScreenCaptureKit stops the stream.
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+    /// Stream settings kept so a frame-rate change rebuilds the full configuration.
+    width: u32,
+    height: u32,
+    pixel_format: CapturePixelFormat,
+    show_cursor: bool,
+    captures_audio: bool,
+}
+
+/// Full SCStream configuration; every reconfiguration must go through here, because
+/// update_configuration replaces all settings (size, format, cursor, audio).
+fn stream_configuration(
+    width: u32,
+    height: u32,
+    fps: u32,
+    pixel_format: CapturePixelFormat,
+    show_cursor: bool,
+    captures_audio: bool,
+) -> SCStreamConfiguration {
+    let frame_interval = CMTime::new(1, fps as i32);
+    SCStreamConfiguration::new()
+        .with_width(width)
+        .with_height(height)
+        .with_scales_to_fit(true)
+        // Letterbox when the display aspect differs from the session (mouse mapping assumes it).
+        .with_preserves_aspect_ratio(true)
+        .with_minimum_frame_interval(&frame_interval)
+        .with_pixel_format(match pixel_format {
+            CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
+            CapturePixelFormat::Bgra | CapturePixelFormat::BgraBuffer => PixelFormat::BGRA,
+        })
+        .with_shows_cursor(show_cursor)
+        .with_captures_audio(captures_audio)
+        .with_sample_rate(AudioSampleRate::Rate48000)
+        .with_channel_count(AudioChannelCount::Stereo)
+        .with_excludes_current_process_audio(true)
 }
 
 struct VideoOutputHandler {
@@ -133,7 +187,7 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         }
 
         let event = match self.pixel_format {
-            CapturePixelFormat::Nv12 => extract_frame_nv12(&sample),
+            CapturePixelFormat::Nv12 | CapturePixelFormat::BgraBuffer => extract_frame_nv12(&sample),
             CapturePixelFormat::Bgra => extract_frame(&sample),
         };
         let Some(event) = event else { return };
@@ -287,7 +341,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     }))
 }
 
-/// Extract a frame in NV12 mode — zero-copy CVPixelBuffer wrapped as SafePixelBuffer.
+/// Extract a frame in NV12 or BgraBuffer mode — zero-copy CVPixelBuffer wrapped as SafePixelBuffer.
 /// The pixel buffer is retained and passed through the channel without locking or copying.
 fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
@@ -355,6 +409,7 @@ pub fn detect_display_scale() -> Result<u32> {
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
+    ensure_screen_access()?;
     let content = SCShareableContent::get()
         .context("Failed to get shareable content")?;
     let display = content.displays().into_iter().next()
@@ -366,6 +421,7 @@ pub fn detect_display_scale() -> Result<u32> {
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
+    ensure_screen_access()?;
     let content = SCShareableContent::get()
         .context("Failed to get shareable content")?;
     let display = content
@@ -391,8 +447,40 @@ pub fn detect_cg_display_size() -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
+/// The display to capture. A just-created virtual display reaches shareable content with a
+/// delay, so a requested id is retried for ~2 s.
+async fn find_display(id: Option<u32>) -> Result<SCDisplay> {
+    for _ in 0..20 {
+        // SCShareableContent::get() is synchronous, run in blocking task
+        let content = tokio::task::spawn_blocking(SCShareableContent::get)
+            .await?
+            .context("Failed to get shareable content (Screen Recording permission needed)")?;
+        let mut displays = content.displays().into_iter();
+        let Some(id) = id else {
+            return displays.next().context("No display found");
+        };
+        if let Some(d) = displays.find(|d| d.display_id() == id) {
+            return Ok(d);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(DisplayMissing(id.unwrap_or_default()).into())
+}
+
+/// Shareable content is readable but the requested display is not in it (it went away).
+#[derive(Debug)]
+pub struct DisplayMissing(pub u32);
+
+impl std::fmt::Display for DisplayMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "display {} not in shareable content", self.0)
+    }
+}
+
+impl std::error::Error for DisplayMissing {}
+
 impl ScreenCapturer {
-    /// Create a new screen capturer for the main display.
+    /// Create a new screen capturer for `config.display_id` (or the first display).
     ///
     /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
     /// to the provided channel as `AudioFrame` (interleaved Float32 PCM, 48 kHz stereo).
@@ -400,16 +488,7 @@ impl ScreenCapturer {
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Result<Self> {
-        // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
-            .await?
-            .context("Failed to get shareable content (Screen Recording permission needed)")?;
-
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .context("No display found")?;
+        let display = find_display(config.display_id).await?;
 
         let actual_width = if config.width == 0 {
             display.width() as u32
@@ -427,23 +506,15 @@ impl ScreenCapturer {
             .with_excluding_windows(&[])
             .build();
 
-        let frame_interval = CMTime::new(1, config.frame_rate as i32);
-
         let captures_audio = audio_tx.is_some();
-        let stream_config = SCStreamConfiguration::new()
-            .with_width(actual_width)
-            .with_height(actual_height)
-            .with_scales_to_fit(true)
-            .with_minimum_frame_interval(&frame_interval)
-            .with_pixel_format(match config.pixel_format {
-                CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
-                CapturePixelFormat::Bgra => PixelFormat::BGRA,
-            })
-            .with_shows_cursor(config.show_cursor)
-            .with_captures_audio(captures_audio)
-            .with_sample_rate(AudioSampleRate::Rate48000)
-            .with_channel_count(AudioChannelCount::Stereo)
-            .with_excludes_current_process_audio(true);
+        let stream_config = stream_configuration(
+            actual_width,
+            actual_height,
+            config.frame_rate,
+            config.pixel_format,
+            config.show_cursor,
+            captures_audio,
+        );
 
         // Channel for capture events: buffer 2 entries to allow for jitter
         let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
@@ -454,7 +525,13 @@ impl ScreenCapturer {
             pixel_format: config.pixel_format,
         };
 
-        let mut stream = SCStream::new(&filter, &stream_config);
+        // Sleep/wake, display reconfiguration and user switch stop the stream through the delegate.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let on_stop = screencapturekit::stream::ErrorHandler::new(move |e| {
+            tracing::warn!(error = ?e, "SCStream stopped");
+            stop_tx.send_replace(true);
+        });
+        let mut stream = SCStream::new_with_delegate(&filter, &stream_config, on_stop);
         stream.add_output_handler(video_handler, SCStreamOutputType::Screen);
 
         // Register audio handler only if a sender was provided
@@ -479,12 +556,18 @@ impl ScreenCapturer {
         Ok(Self {
             stream,
             frame_rx,
+            stop_rx,
+            width: actual_width,
+            height: actual_height,
+            pixel_format: config.pixel_format,
+            show_cursor: config.show_cursor,
+            captures_audio,
         })
     }
 
-    /// Receive the next capture event (async, cancellation safe)
+    /// Receive the next capture event (async, cancellation safe); None once the stream stopped.
     pub async fn next_frame(&mut self) -> Option<CaptureEvent> {
-        self.frame_rx.recv().await
+        recv_or_stop(&mut self.frame_rx, &mut self.stop_rx).await
     }
 
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
@@ -492,20 +575,38 @@ impl ScreenCapturer {
         self.frame_rx.try_recv().ok()
     }
 
-    /// Update capture frame rate at runtime.
+    /// Whether this stream captures audio.
+    pub fn captures_audio(&self) -> bool {
+        self.captures_audio
+    }
+
+    /// Update capture frame rate at runtime, keeping size, pixel format, cursor and audio.
     /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
     pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        use screencapturekit::cm::CMTime;
-        use screencapturekit::prelude::SCStreamConfiguration;
-
-        let interval = CMTime::new(1, fps as i32);
-        let mut config = SCStreamConfiguration::new();
-        config.set_minimum_frame_interval(&interval);
+        let config = stream_configuration(
+            self.width,
+            self.height,
+            fps,
+            self.pixel_format,
+            self.show_cursor,
+            self.captures_audio,
+        );
         self.stream
             .update_configuration(&config)
             .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
         tracing::info!(fps, "Capture frame rate updated");
         Ok(())
+    }
+}
+
+impl Drop for ScreenCapturer {
+    fn drop(&mut self) {
+        // SCStream's own drop only releases it (screencapturekit 1.5.4) and frees the handler
+        // context; stop first so a replaced stream neither keeps running nor calls into freed
+        // memory. Blocks until ScreenCaptureKit confirms; an already stopped stream errors at once.
+        if let Err(e) = self.stream.stop_capture() {
+            tracing::debug!(error = ?e, "SCStream stop on drop");
+        }
     }
 }
 
@@ -522,7 +623,7 @@ pub struct CgFallbackCapturer {
 impl CgFallbackCapturer {
     /// Create a fallback capturer for the main display
     pub fn new(config: &CaptureConfig) -> Self {
-        let display_id = core_graphics::display::CGDisplay::main().id;
+        let display_id = config.display_id.unwrap_or_else(|| core_graphics::display::CGDisplay::main().id);
         let fps = if config.frame_rate > 0 { config.frame_rate } else { 30 };
         Self {
             display_id,
@@ -575,7 +676,15 @@ extern "C" {
     fn CVPixelBufferGetBaseAddressOfPlane(pixel_buffer: *mut c_void, plane: usize) -> *mut u8;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
+    fn CVPixelBufferGetBaseAddress(pixel_buffer: *mut c_void) -> *mut u8;
+    fn CVPixelBufferGetBytesPerRow(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetWidth(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetHeight(pixel_buffer: *mut c_void) -> usize;
 }
+
+/// kCVPixelFormatType_32BGRA ('BGRA')
+const K_CV_PIXEL_FORMAT_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
 /// kCVPixelBufferLock_ReadOnly
 const CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 0x0000_0001;
@@ -678,6 +787,25 @@ impl SafePixelBuffer {
         }
     }
 
+    /// Lock a 32BGRA buffer read-only and pass `(pixels, bytes_per_row, width, height)` to `f`,
+    /// so callers copy only the rows they need. None for other formats or a failed lock.
+    pub fn with_bgra<R>(&self, f: impl FnOnce(&[u8], usize, usize, usize) -> R) -> Option<R> {
+        unsafe {
+            if CVPixelBufferGetPixelFormatType(self.ptr) != K_CV_PIXEL_FORMAT_32BGRA {
+                return None;
+            }
+            if CVPixelBufferLockBaseAddress(self.ptr, CV_PIXEL_BUFFER_LOCK_READ_ONLY) != 0 {
+                return None;
+            }
+            let base = CVPixelBufferGetBaseAddress(self.ptr);
+            let stride = CVPixelBufferGetBytesPerRow(self.ptr);
+            let (w, h) = (CVPixelBufferGetWidth(self.ptr), CVPixelBufferGetHeight(self.ptr));
+            let result = (!base.is_null()).then(|| f(std::slice::from_raw_parts(base, stride * h), stride, w, h));
+            CVPixelBufferUnlockBaseAddress(self.ptr, CV_PIXEL_BUFFER_LOCK_READ_ONLY);
+            result
+        }
+    }
+
     /// Read Y and UV planes while the buffer is locked.
     /// Caller must ensure the buffer is locked before calling.
     unsafe fn read_nv12_planes(&self) -> Option<NV12PlaneData> {
@@ -731,5 +859,88 @@ impl std::fmt::Debug for SafePixelBuffer {
         f.debug_struct("SafePixelBuffer")
             .field("ptr", &self.ptr)
             .finish()
+    }
+}
+
+/// Next capture event, or None once the stream reported a stop. The video handler keeps the
+/// frame sender alive after SCK stops a stream, so the channel alone never ends.
+async fn recv_or_stop(
+    rx: &mut mpsc::Receiver<CaptureEvent>,
+    stopped: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<CaptureEvent> {
+    tokio::select! {
+        biased;
+        // wait_for sees a stop raised earlier too; a dropped sender means no stop can come.
+        raised = async { stopped.wait_for(|s| *s).await.is_ok() } => {
+            if raised { None } else { rx.recv().await }
+        }
+        ev = rx.recv() => ev,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_signal_ends_next_frame_while_sender_alive() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        tx.try_send(CaptureEvent::Idle).unwrap();
+        assert!(matches!(recv_or_stop(&mut rx, &mut stop_rx).await, Some(CaptureEvent::Idle)));
+
+        let waiter = tokio::spawn(async move {
+            let ev = recv_or_stop(&mut rx, &mut stop_rx).await;
+            (ev.is_none(), rx, stop_rx)
+        });
+        tokio::task::yield_now().await;
+        stop_tx.send_replace(true);
+        let (ended, mut rx, mut stop_rx) = waiter.await.unwrap();
+        assert!(ended);
+        // Sticky: later calls end too, even with frames queued and the sender alive.
+        tx.try_send(CaptureEvent::Idle).unwrap();
+        assert!(recv_or_stop(&mut rx, &mut stop_rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_raised_before_waiting_is_not_lost() {
+        let (_tx, mut rx) = mpsc::channel::<CaptureEvent>(2);
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        stop_tx.send_replace(true);
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), recv_or_stop(&mut rx, &mut stop_rx)).await;
+        assert!(matches!(ev, Ok(None)));
+    }
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    extern "C" {
+        fn CVPixelBufferCreate(
+            allocator: *const c_void, width: usize, height: usize, format: u32,
+            attributes: *const c_void, out: *mut *mut c_void,
+        ) -> i32;
+    }
+
+    /// An in-memory pixel buffer (no capture involved), released when the wrapper drops.
+    fn pixel_buffer(w: usize, h: usize, format: u32) -> SafePixelBuffer {
+        let mut raw = std::ptr::null_mut();
+        assert_eq!(unsafe { CVPixelBufferCreate(std::ptr::null(), w, h, format, std::ptr::null(), &mut raw) }, 0);
+        let buf = unsafe { SafePixelBuffer::from_raw(raw) };
+        unsafe { CVPixelBufferRelease(raw) }; // from_raw retained; drop the create reference
+        buf
+    }
+
+    #[test]
+    fn with_bgra_reads_locked_rows() {
+        let buf = pixel_buffer(5, 3, K_CV_PIXEL_FORMAT_32BGRA);
+        let got = buf.with_bgra(|px, stride, w, h| (px.len(), stride, w, h)).expect("BGRA buffer");
+        let (len, stride, w, h) = got;
+        assert_eq!((w, h), (5, 3));
+        assert!(stride >= 5 * 4);
+        assert_eq!(len, stride * 3);
+    }
+
+    #[test]
+    fn with_bgra_rejects_nv12() {
+        let buf = pixel_buffer(16, 16, u32::from_be_bytes(*b"420f"));
+        assert!(buf.with_bgra(|_, _, _, _| ()).is_none());
     }
 }
