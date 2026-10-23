@@ -46,3 +46,5 @@ CLAUDE.local.md
 *.log
 *.git.bak/
 **/.git.bak/
+/target-dist/
+/dist/
