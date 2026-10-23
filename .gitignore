@@ -1,35 +1,48 @@
-
-.claude/
-.DS_Store
-.env
-.env.local
-.idea/
-.serena/
-.spec-workflow/
-.superpowers/
-.vscode/
-*.iml
-*.log
-*.swo
-*.swp
-**/*.rs.bk
-# Rust build artifacts
+# Build output
 /target/
 **/target/
-# Environment
-# IDE
-# Log files
-# macOS
-# Runtime config (contains credentials, use config.example.toml as template)
-# Rust
-# TLS certificates (generated at runtime)
-Cargo.lock
-config.toml
-docs/superpowers/
-tls/
-# Node / Frontend build artifacts
+/build/
+**/*.rs.bk
 node_modules/
-macrdp-ui/dist/
-# Misc
+macrdp-app/*.xcodeproj/
+macrdp-app/MacRDPKit/.build/
+macrdp-app/MacRDPKit/.swiftpm/
+
+# Runtime config and generated TLS identity (never commit credentials)
+config.toml
+tls/
+.env
+.env.*
+
+# AI assistants, agents and planning tools
+.claude/
+.planning/
+.superpowers/
+docs/superpowers/
+.serena/
+.spec-workflow/
+.cursor/
+.windsurf/
+.aider*
+.codex/
+.gemini/
+.agents/
+.gsd/
+.mempalace/
+graphify-out/
+CLAUDE.local.md
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs and backups
+*.log
 *.git.bak/
 **/.git.bak/
