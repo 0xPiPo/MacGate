@@ -1,12 +1,25 @@
 //! Keyboard and mouse input injection via CGEvent
 
+pub mod blocker;
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
 
+pub use blocker::LocalInputBlocker;
 pub use keyboard::KeyboardInjector;
 pub use keymap::scancode_to_keycode;
 pub use mouse::{MouseButton, MouseInjector};
+
+/// Tags an event as injected by macrdp, so the curtain's input block lets it through.
+pub(crate) fn mark(event: &core_graphics::event::CGEvent) {
+    event.set_integer_value_field(blocker::USER_DATA_FIELD, blocker::injected_marker());
+}
+
+/// Posts a marked event where hardware input enters the window server.
+pub(crate) fn post(event: &core_graphics::event::CGEvent) {
+    mark(event);
+    event.post(core_graphics::event::CGEventTapLocation::HID);
+}
 
 // FFI for Accessibility APIs
 extern "C" {
