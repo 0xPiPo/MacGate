@@ -42,6 +42,11 @@ impl FileTransferManager {
         }
     }
 
+    /// Largest file or clipboard payload accepted from or offered to the client.
+    pub fn max_file_size(&self) -> u64 {
+        self.max_file_size
+    }
+
     pub fn set_local_files(&mut self, paths: Vec<PathBuf>) {
         self.local_files = paths;
     }
@@ -121,6 +126,17 @@ impl FileTransferManager {
         let mut requests = Vec::new();
 
         for (index, desc) in self.incoming_descriptors.iter().enumerate() {
+            if desc.file_size.unwrap_or(0) > self.max_file_size {
+                tracing::warn!(
+                    name = ?desc.name,
+                    size = desc.file_size,
+                    max = self.max_file_size,
+                    "Skipping incoming file over the size limit"
+                );
+                // Counted as done so the other files still complete.
+                self.incoming_complete.insert(index as u32);
+                continue;
+            }
             let size_stream = self.next_stream_id;
             self.next_stream_id += 1;
             self.stream_to_index
@@ -171,6 +187,16 @@ impl FileTransferManager {
             return;
         }
 
+        if self.incoming_complete.contains(&file_index) {
+            return;
+        }
+        let received = self.incoming_data.get(&file_index).map_or(0, Vec::len);
+        if (received + data.len()) as u64 > self.max_file_size {
+            tracing::warn!(file_index, max = self.max_file_size, "Incoming file exceeds the size limit, discarding it");
+            self.incoming_data.remove(&file_index);
+            self.incoming_complete.insert(file_index);
+            return;
+        }
         self.incoming_data
             .entry(file_index)
             .or_default()
@@ -198,18 +224,18 @@ impl FileTransferManager {
             if let Some(data) = self.incoming_data.remove(&index) {
                 if desc.name.contains("..") || desc.name.starts_with('/') || desc.name.starts_with('\\')
                 {
-                    tracing::warn!(name = desc.name, "Rejected file with suspicious path");
+                    tracing::warn!(name = ?desc.name, "Rejected file with suspicious path");
                     continue;
                 }
 
                 let file_path = self.temp_dir.join(&desc.name);
                 match fs::write(&file_path, &data) {
                     Ok(()) => {
-                        tracing::debug!(path = %file_path.display(), bytes = data.len(), "Wrote incoming file");
+                        tracing::debug!(path = ?file_path, bytes = data.len(), "Wrote incoming file");
                         paths.push(file_path);
                     }
                     Err(e) => {
-                        tracing::warn!(path = %file_path.display(), error = %e, "Failed to write incoming file");
+                        tracing::warn!(path = ?file_path, error = %e, "Failed to write incoming file");
                     }
                 }
             }
@@ -380,6 +406,47 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "hello");
         assert_eq!(fs::read_to_string(&paths[1]).unwrap(), "bye");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn descriptor(name: &str, size: u64) -> FileDescriptor {
+        FileDescriptor { name: name.to_string(), file_size: Some(size), attributes: None, last_write_time: None }
+    }
+
+    #[test]
+    fn oversized_incoming_file_is_not_requested() {
+        let dir = temp_dir("oversized");
+        let mut mgr = FileTransferManager::new(dir.clone(), 100);
+        mgr.set_incoming_descriptors(vec![descriptor("big.bin", 200), descriptor("small.txt", 3)]);
+
+        let requests = mgr.generate_contents_requests();
+        assert!(requests.iter().all(|r| r.index == 1), "only the small file is requested");
+
+        let data = requests.iter().find(|r| r.flags.contains(FileContentsFlags::DATA)).unwrap();
+        mgr.handle_contents_response(&FileContentsResponse::new_data_response(data.stream_id, b"bye".to_vec()));
+        assert!(mgr.all_incoming_complete());
+
+        let paths = mgr.flush_incoming_files();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("small.txt"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn incoming_data_beyond_cap_is_discarded() {
+        let dir = temp_dir("beyond-cap");
+        let mut mgr = FileTransferManager::new(dir.clone(), 4);
+        // The client declares 3 bytes, then sends more than the cap.
+        mgr.set_incoming_descriptors(vec![descriptor("liar.bin", 3)]);
+        let requests = mgr.generate_contents_requests();
+        let data = requests.iter().find(|r| r.flags.contains(FileContentsFlags::DATA)).unwrap();
+
+        mgr.handle_contents_response(&FileContentsResponse::new_data_response(data.stream_id, vec![7u8; 10]));
+        assert!(mgr.incoming_data.is_empty());
+        assert!(mgr.all_incoming_complete());
+        assert!(mgr.flush_incoming_files().is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }
