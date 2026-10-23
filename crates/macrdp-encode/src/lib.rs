@@ -62,23 +62,8 @@ pub trait VideoEncoder: Send {
     /// Whether this encoder supports AVC444 dual-stream encoding
     fn supports_444(&self) -> bool;
 
-    /// Whether this encoder supports async submit/collect pipelining.
-    fn supports_pipelining(&self) -> bool { false }
-
-    /// Submit a BGRA frame for async encoding. Returns immediately.
-    fn submit_bgra(&mut self, _data: &[u8], _width: u32, _height: u32, _stride: usize) -> Result<()> {
-        anyhow::bail!("submit_bgra not supported by this encoder")
-    }
-
-    /// Submit a CVPixelBuffer for async encoding. Returns immediately.
-    fn submit_pixel_buffer(&mut self, _ptr: *mut std::ffi::c_void) -> Result<()> {
-        anyhow::bail!("submit_pixel_buffer not supported by this encoder")
-    }
-
-    /// Collect result from a previous submit. Blocks up to timeout.
-    fn collect_encoded(&mut self, _timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
-        Ok(None)
-    }
+    /// Whether `encode_pixel_buffer` works (capture can then deliver NV12 zero-copy).
+    fn accepts_pixel_buffer(&self) -> bool { false }
 }
 
 /// Align a dimension up to the nearest multiple of 16 (H.264 macroblock size)
@@ -86,16 +71,16 @@ pub fn align16(v: u32) -> u32 {
     (v + 15) & !15
 }
 
-/// Calculate optimal bitrate for screen content
+/// Bitrate for screen content: pixels x fps x bits-per-pixel, floored at 1 Mbps
+/// (1080p60 HighQuality is about 14.9 Mbps).
 pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
-    let pixels = width as f64 * height as f64;
-    let base_bpp = match quality {
-        Quality::LowLatency => 8.0,
-        Quality::Balanced => 16.0,
-        Quality::HighQuality => 24.0,
+    let bpp = match quality {
+        Quality::LowLatency => 0.06,
+        Quality::Balanced => 0.09,
+        Quality::HighQuality => 0.12,
     };
-    let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
+    let bits = width as f64 * height as f64 * fps as f64 * bpp;
+    (bits.round() as u32).max(1_000_000)
 }
 
 /// Encoder preference
@@ -103,18 +88,17 @@ pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u3
 pub enum EncoderPreference {
     /// OpenH264 CPU encoder — full P-frame support, higher latency (~40ms)
     Software,
-    /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames
+    /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames (default;
+    /// falls back to OpenH264 when VideoToolbox is unavailable)
     Hardware,
-    /// Same as Software (recommended default)
-    Auto,
 }
 
 impl EncoderPreference {
     pub fn from_str_opt(s: Option<&str>) -> Self {
         match s.map(|s| s.to_lowercase()).as_deref() {
-            Some("hardware") | Some("gpu") | Some("videotoolbox") | Some("vt") => Self::Hardware,
             Some("software") | Some("cpu") | Some("openh264") | Some("oh264") => Self::Software,
-            _ => Self::Auto,
+            // hardware / gpu / videotoolbox / vt / auto / unset
+            _ => Self::Hardware,
         }
     }
 }
@@ -139,8 +123,49 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
         }
     }
 
-    // Software / Auto: OpenH264 CPU encoder (full P-frame support)
+    // Software (or VideoToolbox failed): OpenH264 CPU encoder (full P-frame support)
     tracing::info!(enc_w, enc_h, mode_444, "Using OpenH264 software encoder (CPU)");
     let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
     Ok(Box::new(encoder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: u32, b: u32) -> bool {
+        a.abs_diff(b) <= 2
+    }
+
+    #[test]
+    fn bitrate_1080p60_high_quality_is_about_15_mbps() {
+        let b = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
+        assert!((10_000_000..=15_000_000).contains(&b), "{b}");
+    }
+
+    #[test]
+    fn bitrate_scales_with_fps_and_pixels() {
+        let base = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
+        assert!(close(screen_bitrate(1920, 1080, 120.0, Quality::HighQuality), base * 2));
+        assert!(close(screen_bitrate(3840, 2160, 60.0, Quality::HighQuality), base * 4));
+    }
+
+    #[test]
+    fn bitrate_orders_by_quality() {
+        let b = |q| screen_bitrate(1920, 1080, 60.0, q);
+        assert!(b(Quality::LowLatency) < b(Quality::Balanced));
+        assert!(b(Quality::Balanced) < b(Quality::HighQuality));
+    }
+
+    #[test]
+    fn bitrate_has_floor() {
+        assert!(screen_bitrate(320, 240, 1.0, Quality::LowLatency) >= 1_000_000);
+    }
+
+    #[test]
+    fn default_preference_is_hardware() {
+        assert_eq!(EncoderPreference::from_str_opt(None), EncoderPreference::Hardware);
+        assert_eq!(EncoderPreference::from_str_opt(Some("auto")), EncoderPreference::Hardware);
+        assert_eq!(EncoderPreference::from_str_opt(Some("software")), EncoderPreference::Software);
+    }
 }

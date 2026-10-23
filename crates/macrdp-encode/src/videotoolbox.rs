@@ -205,10 +205,28 @@ struct CallbackCtx {
     output: std::sync::Mutex<Option<(Vec<u8>, bool)>>, // (nal_data, is_keyframe)
     ready: std::sync::Condvar,
     has_data: std::sync::atomic::AtomicBool,
+    /// Tag of the frame the encoder waits for (its source_frame_refcon). A callback with
+    /// another tag is a late frame from a timed-out call and must not fill this slot.
+    tag: std::sync::atomic::AtomicUsize,
+}
+
+/// Wake the encoder waiting on `ctx`, holding the lock so the wakeup cannot slip
+/// between its predicate check and its wait. Every callback exit must call this,
+/// or the encoder sits out its timeout. A callback for any frame but the awaited one
+/// (`source` != tag) is dropped, so a late frame never answers the next call.
+fn signal_done(ctx: &CallbackCtx, source: *mut c_void, output: Option<(Vec<u8>, bool)>) {
+    let Ok(mut guard) = ctx.output.lock() else { return };
+    if source as usize != ctx.tag.load(std::sync::atomic::Ordering::Acquire) {
+        tracing::warn!("VT callback for a timed-out frame discarded");
+        return;
+    }
+    *guard = output;
+    ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
+    ctx.ready.notify_one();
 }
 
 extern "C" fn encode_callback(
-    ref_con: *mut c_void, _source: *mut c_void, status: OSStatus,
+    ref_con: *mut c_void, source: *mut c_void, status: OSStatus,
     _info_flags: VTEncodeInfoFlags, sample_buffer: CMSampleBufferRef,
 ) {
     let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
@@ -216,8 +234,7 @@ extern "C" fn encode_callback(
     if status != 0 || sample_buffer.is_null() {
         // Signal has_data so encoder doesn't timeout waiting — it will get empty data
         tracing::warn!(status, null_buf = sample_buffer.is_null(), "VT encode callback error");
-        ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
-        ctx.ready.notify_one();
+        signal_done(ctx, source, None);
         return;
     }
 
@@ -227,12 +244,16 @@ extern "C" fn encode_callback(
     unsafe {
         let format_desc = CMSampleBufferGetFormatDescription(sample_buffer);
         let block_buf = CMSampleBufferGetDataBuffer(sample_buffer);
-        if block_buf.is_null() { return; }
+        if block_buf.is_null() {
+            signal_done(ctx, source, None);
+            return;
+        }
 
         let total_len = CMBlockBufferGetDataLength(block_buf);
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut length: usize = 0;
         if CMBlockBufferGetDataPointer(block_buf, 0, &mut length, std::ptr::null_mut(), &mut data_ptr) != 0 {
+            signal_done(ctx, source, None);
             return;
         }
         let data = std::slice::from_raw_parts(data_ptr, total_len);
@@ -312,13 +333,7 @@ extern "C" fn encode_callback(
         }
     }
 
-    // Signal data ready
-    {
-        let mut guard = ctx.output.lock().unwrap();
-        *guard = Some((annex_b, is_keyframe));
-    }
-    ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
-    ctx.ready.notify_one();
+    signal_done(ctx, source, Some((annex_b, is_keyframe)));
 }
 
 // --- YUV444 reusable buffers for AVC444 mode ---
@@ -393,6 +408,7 @@ impl VtEncoder {
             output: std::sync::Mutex::new(None),
             ready: std::sync::Condvar::new(),
             has_data: std::sync::atomic::AtomicBool::new(false),
+            tag: std::sync::atomic::AtomicUsize::new(0),
         });
 
         // NV12 full-range input for both AVC420 and AVC444.
@@ -1008,17 +1024,20 @@ impl VtEncoder {
         frame_count: u64,
         frame_properties: CFDictionaryRef,
     ) -> Result<(Vec<u8>, bool)> {
-        // Reset callback state
-        {
+        // Reset callback state and tag this frame
+        let tag = {
             let mut guard = ctx.output.lock().unwrap();
             *guard = None;
             ctx.has_data.store(false, std::sync::atomic::Ordering::Release);
-        }
+            let tag = ctx.tag.load(std::sync::atomic::Ordering::Relaxed).wrapping_add(1).max(1);
+            ctx.tag.store(tag, std::sync::atomic::Ordering::Release);
+            tag
+        };
 
         unsafe {
             let enc_status = VTCompressionSessionEncodeFrame(
                 session, pixel_buffer, pts, duration,
-                frame_properties, std::ptr::null_mut(), std::ptr::null_mut(),
+                frame_properties, tag as *mut c_void, std::ptr::null_mut(),
             );
             if enc_status != 0 {
                 anyhow::bail!("VTCompressionSessionEncodeFrame failed: {enc_status}");
@@ -1058,103 +1077,6 @@ impl VtEncoder {
         };
 
         Ok(result)
-    }
-
-    /// Submit a frame for async encoding (reset callback + submit). Returns immediately.
-    fn submit_session_frame(
-        session: VTCompressionSessionRef,
-        ctx: &Arc<CallbackCtx>,
-        pixel_buffer: CVPixelBufferRef,
-        pts: CMTime,
-        duration: CMTime,
-        frame_properties: CFDictionaryRef,
-    ) -> Result<()> {
-        {
-            let mut guard = ctx.output.lock().unwrap();
-            *guard = None;
-            ctx.has_data.store(false, std::sync::atomic::Ordering::Release);
-        }
-        unsafe {
-            let status = VTCompressionSessionEncodeFrame(
-                session, pixel_buffer, pts, duration,
-                frame_properties, std::ptr::null_mut(), std::ptr::null_mut(),
-            );
-            if status != 0 {
-                anyhow::bail!("VTCompressionSessionEncodeFrame failed: {status}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Collect the result from a previous submit. Blocks up to `timeout`.
-    /// CRITICAL: MutexGuard is dropped BEFORE calling VTCompressionSessionCompleteFrames
-    /// to avoid deadlock (the callback needs the lock).
-    fn collect_session_frame(
-        session: VTCompressionSessionRef,
-        ctx: &Arc<CallbackCtx>,
-        timeout: std::time::Duration,
-    ) -> Result<Option<(Vec<u8>, bool)>> {
-        // First wait
-        let timed_out;
-        {
-            let guard = ctx.output.lock().unwrap();
-            let (guard2, wait_result) = ctx.ready.wait_timeout_while(
-                guard, timeout,
-                |_| !ctx.has_data.load(std::sync::atomic::Ordering::Acquire),
-            ).unwrap();
-            timed_out = wait_result.timed_out();
-            drop(guard2); // MUST drop before CompleteFrames
-        }
-
-        if timed_out {
-            tracing::warn!("VT collect timeout — forcing CompleteFrames");
-            unsafe {
-                let pts = CMTime { value: 0, timescale: 1, flags: 0, epoch: 0 };
-                VTCompressionSessionCompleteFrames(session, pts);
-            }
-            // Second wait
-            let guard = ctx.output.lock().unwrap();
-            let (guard2, _) = ctx.ready.wait_timeout_while(
-                guard,
-                std::time::Duration::from_millis(50),
-                |_| !ctx.has_data.load(std::sync::atomic::Ordering::Acquire),
-            ).unwrap();
-            drop(guard2);
-        }
-
-        // Retrieve result
-        let mut guard = ctx.output.lock().unwrap();
-        if ctx.has_data.load(std::sync::atomic::Ordering::Acquire) {
-            Ok(guard.take())
-        } else {
-            tracing::warn!("VT collect: no data after timeout + CompleteFrames");
-            Ok(None)
-        }
-    }
-
-    /// Compute PTS and duration for the current frame.
-    fn make_pts_duration(&self) -> (CMTime, CMTime) {
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
-        (pts, duration)
-    }
-
-    /// Build a force-keyframe properties dict if pending, otherwise return null.
-    fn make_force_keyframe_props(&mut self) -> CFDictionaryRef {
-        if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
-                    1, std::ptr::null(), std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        }
     }
 }
 
@@ -1412,49 +1334,8 @@ impl VideoEncoder for VtEncoder {
         self.mode_444
     }
 
-    fn supports_pipelining(&self) -> bool { true }
-
-    fn submit_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<()> {
-        let pixel_buffer = self.create_nv12_vimage(
-            self.session, self.width, self.height,
-            data, width, height, stride,
-        )?;
-        let (pts, duration) = self.make_pts_duration();
-        let frame_props = self.make_force_keyframe_props();
-
-        let result = Self::submit_session_frame(
-            self.session, &self.callback_ctx, pixel_buffer, pts, duration, frame_props,
-        );
-
-        if !frame_props.is_null() { unsafe { CFRelease(frame_props); } }
-        unsafe { CVPixelBufferRelease(pixel_buffer); }
-        self.frame_count += 1;
-        result
-    }
-
-    fn submit_pixel_buffer(&mut self, ptr: *mut std::ffi::c_void) -> Result<()> {
-        let (pts, duration) = self.make_pts_duration();
-        let frame_props = self.make_force_keyframe_props();
-
-        let result = Self::submit_session_frame(
-            self.session, &self.callback_ctx, ptr as CVPixelBufferRef, pts, duration, frame_props,
-        );
-
-        if !frame_props.is_null() { unsafe { CFRelease(frame_props); } }
-        self.frame_count += 1;
-        result
-    }
-
-    fn collect_encoded(&mut self, timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
-        match Self::collect_session_frame(self.session, &self.callback_ctx, timeout)? {
-            Some((nal_data, is_keyframe)) => Ok(Some(EncodedFrame {
-                data: Bytes::from(nal_data),
-                is_keyframe,
-                width: self.width,
-                height: self.height,
-            })),
-            None => Ok(None),
-        }
+    fn accepts_pixel_buffer(&self) -> bool {
+        true
     }
 }
 
@@ -1466,5 +1347,30 @@ impl Drop for VtEncoder {
                 VTCompressionSessionInvalidate(aux);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn ctx(tag: usize) -> CallbackCtx {
+        CallbackCtx {
+            output: std::sync::Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            has_data: AtomicBool::new(false),
+            tag: AtomicUsize::new(tag),
+        }
+    }
+
+    #[test]
+    fn late_callback_does_not_fill_next_slot() {
+        let c = ctx(2);
+        let ref_con = &c as *const CallbackCtx as *mut c_void;
+        encode_callback(ref_con, 1 as *mut c_void, -1, 0, std::ptr::null());
+        assert!(!c.has_data.load(Ordering::Acquire));
+        encode_callback(ref_con, 2 as *mut c_void, -1, 0, std::ptr::null());
+        assert!(c.has_data.load(Ordering::Acquire));
     }
 }
