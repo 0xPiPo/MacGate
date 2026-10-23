@@ -2,7 +2,7 @@ use core::num::{NonZeroU16, NonZeroUsize};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+pub use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp_graphics::diff;
 use ironrdp_pdu::pointer::PointerPositionAttribute;
 use tracing::{debug, warn};
@@ -24,6 +24,8 @@ pub enum DisplayUpdate {
     GfxFrame(GfxFrameUpdate),
     /// GFX uncompressed dirty rect update (small changes, zero encode latency)
     GfxUncompressed(GfxUncompressedUpdate),
+    /// GFX RemoteFX Progressive dirty tiles, for clients without AVC
+    GfxRemoteFx(GfxRemoteFxUpdate),
     PointerPosition(PointerPositionAttribute),
     ColorPointer(ColorPointer),
     RGBAPointer(RGBAPointer),
@@ -66,6 +68,21 @@ pub struct UncompressedRect {
 #[derive(Debug, Clone)]
 pub struct GfxUncompressedUpdate {
     pub rects: Vec<UncompressedRect>,
+    /// Surface width (for first-frame setup)
+    pub width: u16,
+    /// Surface height (for first-frame setup)
+    pub height: u16,
+}
+
+/// GFX RemoteFX Progressive update (WireToSurface2, RDPGFX_CODECID_CAPROGRESSIVE): the
+/// 64x64 tiles that intersect the dirty region.
+#[derive(Debug, Clone)]
+pub struct GfxRemoteFxUpdate {
+    /// One RFX_PROGRESSIVE_REGION block (MS-RDPEGFX 2.2.4.2.1.5), rects and tiles in surface
+    /// coordinates. The GFX layer adds the SYNC/CONTEXT and frame blocks.
+    pub data: Bytes,
+    /// Tiles in the region (for logs).
+    pub tiles: usize,
     /// Surface width (for first-frame setup)
     pub width: u16,
     /// Surface height (for first-frame setup)
@@ -340,6 +357,10 @@ pub trait RdpServerDisplay: Send {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         debug!(?layout, "Requesting layout")
     }
+
+    /// A new client session starts (not called on deactivation-reactivation).
+    /// `desktop_scale_factor` is the client's GCC core data scale (percent), when sent.
+    fn begin_session(&mut self, _desktop_scale_factor: Option<u32>) {}
 
     /// Request a specific resolution (called during client capability negotiation).
     /// May be ignored if the display has a fixed resolution.

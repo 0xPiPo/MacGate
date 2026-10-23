@@ -62,7 +62,7 @@ rayon = ["dep:rayon"]
 [lib]
 name = "ironrdp_server"
 path = "src/lib.rs"
-test = false
+test = true
 doctest = true
 
 [dependencies.anyhow]
@@ -130,7 +130,17 @@ features = [
     "macros",
     "sync",
     "rt",
+    "time",
 ]
+
+[dependencies.futures-util]
+version = "0.3"
+default-features = false
+features = ["std"]
+
+[dependencies.socket2]
+version = "0.6"
+features = ["all"]
 
 [dependencies.tokio-rustls]
 version = "0.26"
@@ -147,13 +157,12 @@ optional = true
 version = "0.2.5"
 optional = true
 
+[dependencies.zeroize]
+version = "1"
+
 [dependencies.zstd-safe]
 version = "7.2"
 optional = true
-
-[dev-dependencies.tokio]
-version = "1"
-features = ["sync"]
 
 [lints.clippy]
 alloc_instead_of_core = "warn"

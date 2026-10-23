@@ -37,6 +37,8 @@ pub enum MouseEvent {
     Button5Pressed,
     Button5Released,
     VerticalScroll { value: i16 },
+    /// Positive = right (PTR_FLAGS_HWHEEL)
+    HorizontalScroll { value: i16 },
     Scroll { x: i32, y: i32 },
     RelMove { x: i32, y: i32 },
 }
@@ -160,9 +162,19 @@ impl From<MousePdu> for MouseEvent {
             } else {
                 MouseEvent::RightReleased
             }
+        } else if value.flags.contains(PointerFlags::MIDDLE_BUTTON_OR_WHEEL) {
+            if value.flags.contains(PointerFlags::DOWN) {
+                MouseEvent::MiddlePressed
+            } else {
+                MouseEvent::MiddleReleased
+            }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
             MouseEvent::VerticalScroll {
-                value: value.number_of_wheel_rotation_units,
+                value: wheel_rotation(value.number_of_wheel_rotation_units),
+            }
+        } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
+            MouseEvent::HorizontalScroll {
+                value: wheel_rotation(value.number_of_wheel_rotation_units),
             }
         } else {
             MouseEvent::Move {
@@ -173,19 +185,31 @@ impl From<MousePdu> for MouseEvent {
     }
 }
 
+/// Undo ironrdp-pdu's wheel decode, which negates the low 8 bits instead of
+/// sign-extending the 9-bit WheelRotationMask (0x188 must be -120, not -136).
+fn wheel_rotation(decoded: i16) -> i16 {
+    if decoded < 0 {
+        // decoded = -low8, true value = low8 - 0x100
+        -(0x100 + decoded)
+    } else {
+        decoded
+    }
+}
+
 impl From<MouseXPdu> for MouseEvent {
     fn from(value: MouseXPdu) -> Self {
+        // PTR_XFLAGS_BUTTON1/2 are the extended (X1/X2) buttons, not left/right.
         if value.flags.contains(PointerXFlags::BUTTON1) {
             if value.flags.contains(PointerXFlags::DOWN) {
-                MouseEvent::LeftPressed
+                MouseEvent::Button4Pressed
             } else {
-                MouseEvent::LeftReleased
+                MouseEvent::Button4Released
             }
         } else if value.flags.contains(PointerXFlags::BUTTON2) {
             if value.flags.contains(PointerXFlags::DOWN) {
-                MouseEvent::RightPressed
+                MouseEvent::Button5Pressed
             } else {
-                MouseEvent::RightReleased
+                MouseEvent::Button5Released
             }
         } else {
             MouseEvent::Move {

@@ -1,4 +1,7 @@
-use core::net::SocketAddr;
+use core::cell::Cell;
+use core::net::{IpAddr, SocketAddr};
+use core::pin::Pin;
+use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -9,13 +12,12 @@ use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsRequest, OwnedFileContentsResponse};
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_core::{decode, encode_vec, impl_as_any};
-use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
-use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
+use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu};
+use ironrdp_displaycontrol::server::DisplayControlHandler;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
-pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
@@ -26,15 +28,20 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
+use futures_util::future::{abortable, AbortHandle};
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
+use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
 use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
+use crate::auth::RdpAuthenticator;
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::gfx::{GfxHandler, GfxState};
-use crate::handler::RdpServerInputHandler;
+use crate::handler::{MouseEvent, RdpServerInputHandler};
+use crate::lifecycle::SessionLifecycle;
 use crate::{builder, capabilities, SoundServerFactory};
 
 #[derive(Clone)]
@@ -89,19 +96,26 @@ impl RdpServerSecurity {
         match self {
             RdpServerSecurity::None => nego::SecurityProtocol::empty(),
             RdpServerSecurity::Tls(_) => nego::SecurityProtocol::SSL,
-            // Advertise HYBRID + HYBRID_EX + SSL so the acceptor can negotiate
-            // down to TLS-only if the client doesn't support NLA
-            RdpServerSecurity::Hybrid(_) => {
-                nego::SecurityProtocol::HYBRID
-                    | nego::SecurityProtocol::HYBRID_EX
-                    | nego::SecurityProtocol::SSL
-            }
+            // NLA only: a TLS-only or standard-security client gets a negotiation failure.
+            RdpServerSecurity::Hybrid(_) => nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX,
         }
     }
 }
 
 struct AInputHandler {
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    /// Feeds one blocking worker, so mouse events apply in arrival order.
+    mouse_tx: mpsc::UnboundedSender<MouseEvent>,
+}
+
+/// Start the ainput mouse worker; it exits when the returned sender drops.
+fn spawn_mouse_worker(handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>) -> mpsc::UnboundedSender<MouseEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    task::spawn_blocking(move || {
+        while let Some(event) = rx.blocking_recv() {
+            handler.blocking_lock().mouse(event);
+        }
+    });
+    tx
 }
 
 impl_as_any!(AInputHandler);
@@ -126,10 +140,9 @@ impl dvc::DvcProcessor for AInputHandler {
 
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
-                let handler = Arc::clone(&self.handler);
-                task::spawn_blocking(move || {
-                    handler.blocking_lock().mouse(pdu.into());
-                });
+                if self.mouse_tx.send(pdu.into()).is_err() {
+                    debug!("ainput mouse worker stopped; dropping event");
+                }
             }
         }
 
@@ -140,21 +153,91 @@ impl dvc::DvcProcessor for AInputHandler {
 impl dvc::DvcServerProcessor for AInputHandler {}
 
 struct DisplayControlBackend {
-    display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    /// Feeds one blocking worker, so monitor layouts apply in arrival order.
+    layout_tx: mpsc::UnboundedSender<DisplayControlMonitorLayout>,
 }
 
 impl DisplayControlBackend {
+    /// Starts the layout worker; it exits when the backend drops.
     fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>) -> Self {
-        Self { display }
+        let (layout_tx, mut rx) = mpsc::unbounded_channel();
+        task::spawn_blocking(move || {
+            while let Some(layout) = rx.blocking_recv() {
+                display.blocking_lock().request_layout(layout);
+            }
+        });
+        Self { layout_tx }
     }
 }
 
 impl DisplayControlHandler for DisplayControlBackend {
     fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
-        let display = Arc::clone(&self.display);
-        task::spawn_blocking(move || display.blocking_lock().request_layout(layout));
+        if self.layout_tx.send(layout).is_err() {
+            debug!("display layout worker stopped; dropping layout");
+        }
     }
 }
+
+/// Display Control capabilities (MS-RDPEDISP 2.2.2.1): one monitor, and a maximum area of
+/// MaxNumMonitors x FactorA x FactorB square pixels. 8192 x 8192 covers every size the display
+/// accepts (sides 200..=8192); ironrdp's default (3840 x 2400) refused layouts above 9.2 MP.
+const DISPLAY_CONTROL_CAPS: (u32, u32, u32) = (1, 8192, 8192);
+
+/// The Display Control channel: capabilities on open, client monitor layouts to the display.
+/// Logged at info so a client that never opens it (and stretches instead) is visible.
+struct DisplayControlChannel {
+    backend: DisplayControlBackend,
+}
+
+impl_as_any!(DisplayControlChannel);
+
+impl dvc::DvcProcessor for DisplayControlChannel {
+    fn channel_name(&self) -> &str {
+        ironrdp_displaycontrol::CHANNEL_NAME
+    }
+
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<dvc::DvcMessage>> {
+        let (monitors, a, b) = DISPLAY_CONTROL_CAPS;
+        let caps = DisplayControlCapabilities::new(monitors, a, b).map_err(|e| decode_err!(e))?;
+        info!(
+            channel_id,
+            max_monitors = monitors,
+            max_area_factor_a = a,
+            max_area_factor_b = b,
+            "Display Control channel opened, capabilities sent"
+        );
+        Ok(vec![Box::new(DisplayControlPdu::from(caps))])
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        info!(channel_id, "Display Control channel closed");
+    }
+
+    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<dvc::DvcMessage>> {
+        match decode(payload).map_err(|e| decode_err!(e))? {
+            DisplayControlPdu::MonitorLayout(layout) => {
+                for m in layout.monitors() {
+                    let (width, height) = m.dimensions();
+                    info!(
+                        width,
+                        height,
+                        primary = m.is_primary(),
+                        orientation = m.orientation().map(|o| o.angle()),
+                        desktop_scale = m.desktop_scale_factor(),
+                        device_scale = m.device_scale_factor().map(|s| s.value()),
+                        physical_mm = ?m.physical_dimensions(),
+                        "Display Control monitor layout received"
+                    );
+                }
+                self.backend.monitor_layout(layout);
+            }
+            DisplayControlPdu::Caps(caps) => debug!(?caps, "Display Control capabilities from client"),
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl dvc::DvcServerProcessor for DisplayControlChannel {}
 
 /// RDP Server
 ///
@@ -227,7 +310,10 @@ pub struct RdpServer {
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
-    creds: Option<Credentials>,
+    auth: Option<Arc<dyn RdpAuthenticator>>,
+    session_lifecycle: Option<Arc<dyn SessionLifecycle>>,
+    handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
     local_addr: Option<SocketAddr>,
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
@@ -240,8 +326,9 @@ pub enum ServerEvent {
     ClipboardFileContents(OwnedFileContentsResponse),
     ClipboardFileContentsRequest(FileContentsRequest),
     Rdpsnd(RdpsndServerMessage),
-    SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
+    /// Ends the active session; the listener keeps running. Ignored when idle.
+    Disconnect,
 }
 
 pub trait ServerEventSender {
@@ -285,7 +372,10 @@ impl RdpServer {
             cliprdr_factory,
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
-            creds: None,
+            auth: None,
+            session_lifecycle: None,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            idle_timeout: None,
             local_addr: None,
             gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false))),
             gfx_enabled: true,
@@ -333,9 +423,9 @@ impl RdpServer {
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
         let mut dvc = dvc::DrdynvcServer::new()
             .with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
+                mouse_tx: spawn_mouse_worker(Arc::clone(&self.handler)),
             })
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+            .with_dynamic_channel(DisplayControlChannel { backend: dcs_backend });
 
         // Only register GFX channel if GFX frame sending is enabled
         if self.gfx_enabled {
@@ -347,9 +437,13 @@ impl RdpServer {
         acceptor.attach_static_channel(dvc);
     }
 
-    pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
-        let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
-        let framed = TokioFramed::new(stream);
+    /// Makes an authenticated handshake the active session.
+    async fn run_session(&mut self, hs: Handshaked) -> Result<()> {
+        let Handshaked {
+            framed,
+            mut acceptor,
+            peer,
+        } = hs;
 
         // Reset GFX state for new connection, preserving peer IP and hot-updated resolution
         let pending_resolution = {
@@ -359,7 +453,7 @@ impl RdpServer {
             let avc444_enabled = gs.avc444_enabled;
             let res = gs.resolution.take();
             *gs = GfxState::new(w, h, avc444_enabled);
-            gs.peer_addr = peer_ip;
+            gs.peer_addr = Some(peer.ip());
             res
         };
 
@@ -378,73 +472,85 @@ impl RdpServer {
         }
 
         let size = self.display.lock().await.size().await;
-        let capabilities = capabilities::capabilities(&self.opts, size);
-        let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
-
+        acceptor.set_desktop(size, capabilities::capabilities(&self.opts, size));
         self.attach_channels(&mut acceptor);
 
-        let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
-            .await
-            .context("accept_begin failed")?;
-
-        match res {
-            BeginResult::ShouldUpgrade(stream) => {
-                let tls_acceptor = match &self.opts.security {
-                    RdpServerSecurity::Tls(acceptor) => acceptor,
-                    RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
-                    RdpServerSecurity::None => unreachable!(),
-                };
-                let accept = match tls_acceptor.accept(stream).await {
-                    Ok(accept) => accept,
-                    Err(e) => {
-                        warn!("Failed to TLS accept: {}", e);
-                        return Ok(());
-                    }
-                };
-                let mut framed = TokioFramed::new(accept);
-
-                acceptor.mark_security_upgrade_as_done();
-
-                if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
-                    // how to get the client name?
-                    // doesn't seem to matter yet
-                    let client_name = framed.get_inner().0.get_ref().0.peer_addr()?.to_string();
-
-                    ironrdp_acceptor::accept_credssp(
-                        &mut framed,
-                        &mut acceptor,
-                        &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
-                        client_name.into(),
-                        pub_key.clone(),
-                        None,
-                    )
-                    .await?;
-                }
-
-                let framed = self.accept_finalize(framed, acceptor).await?;
-                debug!("Shutting down TLS connection");
-                let (mut tls_stream, _) = framed.into_inner();
-                if let Err(e) = tls_stream.shutdown().await {
-                    debug!(?e, "TLS shutdown error");
-                }
-            }
-
-            BeginResult::Continue(framed) => {
-                self.accept_finalize(framed, acceptor).await?;
-            }
-        };
-
+        let framed = self.accept_finalize(framed, acceptor).await?;
+        debug!("Shutting down TLS connection");
+        let (mut tls_stream, _) = framed.into_inner();
+        if let Err(e) = tls_stream.shutdown().await {
+            debug!(?e, "TLS shutdown error");
+        }
         Ok(())
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let listener = TcpListener::bind(self.opts.addr).await?;
-        let local_addr = listener.local_addr()?;
+        self.run_on(listener).await
+    }
 
+    /// Serves connections from an already bound listener.
+    ///
+    /// Each socket handshakes (negotiation, TLS, CredSSP) in its own future with a
+    /// timeout per stage, so no peer can block the server. At most two handshakes per
+    /// source IP and eight in total run at once; when full, the oldest unauthenticated
+    /// one is evicted. Only an authenticated connection becomes the active session, and
+    /// it replaces the previous one.
+    pub async fn run_on(&mut self, listener: TcpListener) -> Result<()> {
+        let RdpServerSecurity::Hybrid((tls, pub_key)) = self.opts.security.clone() else {
+            bail!("only NLA (hybrid) security is supported");
+        };
+        let auth = self.auth.clone().context("no authenticator configured")?;
+        let ctx = Rc::new(HandshakeCtx {
+            tls,
+            pub_key,
+            security: self.opts.security.flag(),
+            auth,
+        });
+
+        let local_addr = listener.local_addr()?;
         debug!("Listening for connections on {local_addr}");
         self.local_addr = Some(local_addr);
 
+        let mut handshakes: FuturesUnordered<HandshakeFuture> = FuturesUnordered::new();
+        let mut slots = HandshakeSlots::default();
+        let mut next: Option<Handshaked> = None;
+
         loop {
+            if let Some(hs) = next.take() {
+                let peer = hs.peer;
+                // Dropped when this session ends, including when this future is cancelled.
+                let mut guard = self.session_lifecycle.as_ref().map(|l| l.session_started(peer));
+                {
+                    let session = self.run_session(hs);
+                    tokio::pin!(session);
+                    loop {
+                        tokio::select! {
+                            result = &mut session => {
+                                log_session_end(peer, result);
+                                break;
+                            }
+                            accepted = listener.accept() => start_handshake(&ctx, &mut handshakes, &mut slots, accepted),
+                            Some((id, done)) = handshakes.next() => {
+                                slots.remove(id);
+                                if let Some(hs) = done {
+                                    info!(old = %peer, new = %hs.peer, "New authenticated connection replaces the active session");
+                                    if let Some(guard) = guard.as_mut() {
+                                        guard.replaced();
+                                    }
+                                    next = Some(hs);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(guard);
+                info!("Ready for next connection");
+                self.static_channels = StaticChannelSet::new();
+                continue;
+            }
+
             let ev_receiver = Arc::clone(&self.ev_receiver);
             let mut ev_receiver = ev_receiver.lock().await;
             tokio::select! {
@@ -457,29 +563,16 @@ impl RdpServer {
                         ServerEvent::GetLocalAddr(tx) => {
                             let _ = tx.send(self.local_addr);
                         }
-                        ServerEvent::SetCredentials(creds) => {
-                            self.set_credentials(Some(creds));
-                        }
                         ev => {
                             debug!("Unexpected event {:?}", ev);
                         }
                     }
                 },
-                Ok((stream, peer)) = listener.accept() => {
-                    debug!(?peer, "Received connection");
-                    drop(ev_receiver);
-                    if let Err(error) = self.run_connection(stream).await {
-                        let err_str = format!("{error:#}");
-                        if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
-                            warn!("Client disconnected: {err_str}");
-                        } else {
-                            error!(?error, "Connection error");
-                        }
-                    }
-                    info!("Ready for next connection");
-                    self.static_channels = StaticChannelSet::new();
+                accepted = listener.accept() => start_handshake(&ctx, &mut handshakes, &mut slots, accepted),
+                Some((id, done)) = handshakes.next() => {
+                    slots.remove(id);
+                    next = done;
                 }
-                else => break,
             }
         }
 
@@ -545,7 +638,7 @@ impl RdpServer {
         // Handle GFX frames through the DVC channel
         if let DisplayUpdate::GfxFrame(ref gfx_frame) = update {
             let mut state = gfx_state.lock().unwrap();
-            if state.is_ready() {
+            if state.avc_ready() {
                 if let Some(drdynvc_id) = drdynvc_channel_id {
                     let channel_id = state.channel_id.unwrap();
                     // All frame PDUs combined into a single ZGFX-wrapped buffer
@@ -577,13 +670,17 @@ impl RdpServer {
             }
         }
 
-        // Handle GFX uncompressed dirty rect updates through the DVC channel
-        if let DisplayUpdate::GfxUncompressed(ref uncompressed) = update {
+        // Handle GFX uncompressed / RemoteFX dirty-region updates through the DVC channel
+        if matches!(update, DisplayUpdate::GfxUncompressed(_) | DisplayUpdate::GfxRemoteFx(_)) {
             let mut state = gfx_state.lock().unwrap();
             if state.is_ready() {
                 if let Some(drdynvc_id) = drdynvc_channel_id {
                     let channel_id = state.channel_id.unwrap();
-                    let pdu_data = GfxHandler::create_uncompressed_pdu(&mut state, uncompressed);
+                    let pdu_data = match &update {
+                        DisplayUpdate::GfxRemoteFx(rfx) => GfxHandler::create_remotefx_pdu(&mut state, rfx),
+                        DisplayUpdate::GfxUncompressed(raw) => GfxHandler::create_uncompressed_pdu(&mut state, raw),
+                        _ => unreachable!("matched above"),
+                    };
                     drop(state);
 
                     let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
@@ -648,11 +745,12 @@ impl RdpServer {
                     debug!("Got quit event: {reason}");
                     return Ok(RunState::Disconnect);
                 }
+                ServerEvent::Disconnect => {
+                    info!("Disconnect requested by the host");
+                    return Ok(RunState::Disconnect);
+                }
                 ServerEvent::GetLocalAddr(tx) => {
                     let _ = tx.send(self.local_addr);
-                }
-                ServerEvent::SetCredentials(creds) => {
-                    self.set_credentials(Some(creds));
                 }
                 ServerEvent::Rdpsnd(s) => {
                     let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
@@ -776,13 +874,19 @@ impl RdpServer {
 
         // Get DRDYNVC channel ID for sending GFX frames
         let drdynvc_channel_id = self.get_channel_id_by_type::<dvc::DrdynvcServer>();
+        let idle_timeout = self.idle_timeout;
 
         let s = Rc::new(Mutex::new(self));
 
         let this = Rc::clone(&s);
         let dispatch_pdu = async move {
             loop {
-                let (action, bytes) = reader.read_pdu().await?;
+                let (action, bytes) = match idle_timeout {
+                    Some(limit) => tokio::time::timeout(limit, reader.read_pdu())
+                        .await
+                        .map_err(|_| anyhow!("idle timeout: no client activity for {limit:?}"))??,
+                    None => reader.read_pdu().await?,
+                };
                 let mut this = this.lock().await;
                 match this
                     .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
@@ -890,6 +994,9 @@ impl RdpServer {
 
         self.static_channels = result.static_channels;
         if !result.reactivation {
+            // Before the capabilities below size the session.
+            self.display.lock().await.begin_session(result.desktop_scale_factor);
+            self.gfx_state.lock().unwrap().client_name = result.client_name;
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
@@ -1063,6 +1170,21 @@ impl RdpServer {
                     return Ok(true);
                 }
 
+                rdp::headers::ShareDataPdu::RefreshRectangle(_) => {
+                    debug!("Client RefreshRect: requesting IDR");
+                    self.gfx_state.lock().unwrap().request_idr();
+                }
+
+                rdp::headers::ShareDataPdu::SuppressOutput(pdu) => {
+                    if pdu.desktop_rect.is_some() {
+                        debug!("Client resumed display output: requesting IDR");
+                        self.gfx_state.lock().unwrap().request_idr();
+                    } else {
+                        // Pausing output is not implemented; frames keep flowing.
+                        debug!("Client suppressed display output");
+                    }
+                }
+
                 unexpected => {
                     warn!(?unexpected, "Unexpected share data pdu");
                 }
@@ -1152,9 +1274,11 @@ impl RdpServer {
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
         loop {
-            let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
-                .await
-                .context("failed to accept client during finalize")?;
+            let (new_framed, result) =
+                tokio::time::timeout(self.handshake_timeout, ironrdp_acceptor::accept_finalize(framed, &mut acceptor))
+                    .await
+                    .context("connect sequence timed out")?
+                    .context("failed to accept client during finalize")?;
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
@@ -1183,9 +1307,25 @@ impl RdpServer {
         }
     }
 
-    pub fn set_credentials(&mut self, creds: Option<Credentials>) {
-        debug!(?creds, "Changing credentials");
-        self.creds = creds
+    /// Hooks the start and end of each active session (keep awake, lock on end).
+    pub fn set_session_lifecycle(&mut self, lifecycle: Arc<dyn SessionLifecycle>) {
+        self.session_lifecycle = Some(lifecycle);
+    }
+
+    /// Sets who may connect. Without an authenticator [`RdpServer::run`] refuses to start.
+    pub fn set_authenticator(&mut self, auth: Arc<dyn RdpAuthenticator>) {
+        self.auth = Some(auth);
+    }
+
+    /// Time allowed for the connect sequence after authentication, and for each resize
+    /// reactivation. Negotiation (3 s), TLS (3 s) and CredSSP (30 s) have fixed budgets.
+    pub fn set_handshake_timeout(&mut self, timeout: Duration) {
+        self.handshake_timeout = timeout;
+    }
+
+    /// Disconnects a session that sends nothing for this long. `None` disables it.
+    pub fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
+        self.idle_timeout = timeout;
     }
 }
 
@@ -1232,7 +1372,7 @@ where
     W: FramedWrite,
 {
     type WriteAllFut<'write>
-        = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'write>>
+        = Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'write>>
     where
         Self: 'write;
 
@@ -1251,5 +1391,455 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
         Self {
             writer: Rc::new(Mutex::new(writer)),
         }
+    }
+}
+
+/// Connect sequence after authentication (and each resize reactivation). The stages
+/// before it have their own budgets: [`X224_TIMEOUT`], [`TLS_TIMEOUT`], [`CREDSSP_TIMEOUT`].
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One X.224 connection request: a real client sends it at once.
+const X224_TIMEOUT: Duration = Duration::from_secs(3);
+/// TLS handshake; the client's certificate prompt comes after it, inside CredSSP.
+const TLS_TIMEOUT: Duration = Duration::from_secs(3);
+/// CredSSP, generous because the client may wait on the user (certificate prompt).
+const CREDSSP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Handshakes in flight at once; when full, the oldest unauthenticated one is evicted.
+const MAX_HANDSHAKES: usize = 8;
+/// Handshakes in flight from one source IP; past it, that IP's oldest unauthenticated one is
+/// evicted (a client's idle probe must not refuse its next connection), else it is refused.
+const MAX_HANDSHAKES_PER_IP: usize = 2;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Accept,
+    /// Accept after evicting the handshake with this id.
+    AcceptEvicting(u64),
+    Refuse,
+}
+
+struct Slot {
+    id: u64,
+    ip: IpAddr,
+    /// Set once the authenticator accepted the client; such a handshake is never evicted.
+    authenticated: Rc<Cell<bool>>,
+    abort: AbortHandle,
+}
+
+/// Handshakes in flight, oldest first, so idle sockets cannot starve the owner.
+#[derive(Default)]
+struct HandshakeSlots {
+    next_id: u64,
+    slots: Vec<Slot>,
+}
+
+impl HandshakeSlots {
+    fn admit(&self, ip: IpAddr) -> Admission {
+        let mut same_ip = self.slots.iter().filter(|s| s.ip == ip);
+        if same_ip.clone().count() >= MAX_HANDSHAKES_PER_IP {
+            return match same_ip.find(|s| !s.authenticated.get()) {
+                Some(oldest) => Admission::AcceptEvicting(oldest.id),
+                None => Admission::Refuse,
+            };
+        }
+        if self.slots.len() < MAX_HANDSHAKES {
+            return Admission::Accept;
+        }
+        match self.slots.iter().find(|s| !s.authenticated.get()) {
+            Some(oldest) => Admission::AcceptEvicting(oldest.id),
+            None => Admission::Refuse,
+        }
+    }
+
+    fn insert(&mut self, ip: IpAddr, authenticated: Rc<Cell<bool>>, abort: AbortHandle) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.slots.push(Slot { id, ip, authenticated, abort });
+        id
+    }
+
+    fn remove(&mut self, id: u64) -> Option<Slot> {
+        let index = self.slots.iter().position(|s| s.id == id)?;
+        Some(self.slots.remove(index))
+    }
+}
+
+/// A connection that passed negotiation, TLS and CredSSP.
+struct Handshaked {
+    framed: TokioFramed<TlsStream<TcpStream>>,
+    acceptor: Acceptor,
+    peer: SocketAddr,
+}
+
+/// Resolves to the slot id and, on success, the authenticated connection.
+type HandshakeFuture = Pin<Box<dyn core::future::Future<Output = (u64, Option<Handshaked>)>>>;
+
+struct HandshakeCtx {
+    tls: TlsAcceptor,
+    pub_key: Vec<u8>,
+    security: nego::SecurityProtocol,
+    auth: Arc<dyn RdpAuthenticator>,
+}
+
+fn start_handshake(
+    ctx: &Rc<HandshakeCtx>,
+    handshakes: &mut FuturesUnordered<HandshakeFuture>,
+    slots: &mut HandshakeSlots,
+    accepted: std::io::Result<(TcpStream, SocketAddr)>,
+) {
+    let (stream, peer) = match accepted {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            warn!(%error, "Accept failed");
+            return;
+        }
+    };
+    let admission = slots.admit(peer.ip());
+    if admission == Admission::Refuse {
+        warn!(%peer, "Too many handshakes in flight, closing connection");
+        return;
+    }
+    if !ctx.auth.admit(peer.ip()) {
+        warn!(%peer, "Source is in authentication backoff, closing connection");
+        return;
+    }
+    if let Admission::AcceptEvicting(id) = admission {
+        if let Some(evicted) = slots.remove(id) {
+            // Not a failure: the evicted socket may be the owner's.
+            info!(evicted = %evicted.ip, new = %peer, "Handshake slots busy, evicting the oldest unauthenticated one");
+            evicted.abort.abort();
+        }
+    }
+    set_keepalive(&stream);
+    if let Err(error) = stream.set_nodelay(true) {
+        debug!(%error, "Failed to set TCP_NODELAY");
+    }
+    let authenticated = Rc::new(Cell::new(false));
+    let ctx = Rc::clone(ctx);
+    let inner_authenticated = Rc::clone(&authenticated);
+    let (future, abort) = abortable(async move {
+        match handshake(&ctx, stream, peer, &inner_authenticated).await {
+            Ok(hs) => Some(hs),
+            Err(error) if error.is::<TlsIdle>() => {
+                debug!(%peer, "Client left a negotiated connection idle before TLS (spare connection)");
+                None
+            }
+            Err(error) => {
+                warn!(%peer, error = format!("{error:#}"), "Handshake failed");
+                None
+            }
+        }
+    });
+    let id = slots.insert(peer.ip(), authenticated, abort);
+    handshakes.push(Box::pin(async move { (id, future.await.ok().flatten()) }));
+}
+
+/// The client negotiated, then did not finish TLS within [`TLS_TIMEOUT`]. The iOS client
+/// opens such a spare connection beside each real one; no credential was tried, so it is
+/// neither logged as a failure nor counted toward backoff (per-IP slots still bound it).
+#[derive(Debug)]
+struct TlsIdle;
+
+impl core::fmt::Display for TlsIdle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TLS accept timed out")
+    }
+}
+
+impl std::error::Error for TlsIdle {}
+
+/// Records a pre-authentication failure for `ip` (never a credential guess).
+async fn report_handshake_failed(auth: &Arc<dyn RdpAuthenticator>, ip: IpAddr) {
+    let auth = Arc::clone(auth);
+    let _ = task::spawn_blocking(move || auth.handshake_failed(ip)).await;
+}
+
+/// Negotiation, TLS and CredSSP, then the authenticator's final decision.
+///
+/// Each stage has its own timeout. Failures and timeouts before authentication are
+/// reported with `handshake_failed`, except an idle TLS stage ([`TlsIdle`]); a failed CredSSP exchange counts once as a
+/// credential failure. `authenticated` is set when the authenticator accepted the client.
+async fn handshake(
+    ctx: &HandshakeCtx,
+    stream: TcpStream,
+    peer: SocketAddr,
+    authenticated: &Rc<Cell<bool>>,
+) -> Result<Handshaked> {
+    debug!(%peer, "Received connection");
+    let auth = Arc::clone(&ctx.auth);
+    let identity = task::spawn_blocking(move || auth.ntlm_identity())
+        .await?
+        .context("no Mac account enrolled")?;
+    let creds = ironrdp_acceptor::credssp::ntlm_hash_credentials(&identity.username, &identity.nt_hash);
+    drop(identity);
+
+    // Desktop size and capabilities are set when this becomes the active session.
+    let size = DesktopSize { width: 0, height: 0 };
+    let mut acceptor = Acceptor::new(ctx.security, size, Vec::new(), Some(creds));
+
+    let peer_ip = peer.ip();
+    let pre_auth = async {
+        let begin = tokio::time::timeout(
+            X224_TIMEOUT,
+            ironrdp_acceptor::accept_begin(TokioFramed::new(stream), &mut acceptor),
+        )
+        .await
+        .context("security negotiation timed out")?
+        .context("security negotiation failed")?;
+        let BeginResult::ShouldUpgrade(stream) = begin else {
+            bail!("client did not negotiate NLA");
+        };
+        tokio::time::timeout(TLS_TIMEOUT, ctx.tls.accept(stream))
+            .await
+            .map_err(|_| anyhow::Error::new(TlsIdle))?
+            .context("TLS accept failed")
+    };
+    let tls_stream = match pre_auth.await {
+        Ok(tls_stream) => tls_stream,
+        Err(error) => {
+            if !error.is::<TlsIdle>() {
+                report_handshake_failed(&ctx.auth, peer_ip).await;
+            }
+            return Err(error);
+        }
+    };
+    let mut framed = TokioFramed::new(tls_stream);
+    acceptor.mark_security_upgrade_as_done();
+
+    let auth = Arc::clone(&ctx.auth);
+    // authorize() records its own failure; CredSSP errors before it are recorded below.
+    let authorize_ran = Rc::new(Cell::new(false));
+    let authorize_ran_inner = Rc::clone(&authorize_ran);
+    let authenticated_inner = Rc::clone(authenticated);
+    let mut network_client = ironrdp_tokio::reqwest::ReqwestNetworkClient::new();
+    let credssp = ironrdp_acceptor::accept_credssp(
+        &mut framed,
+        &mut acceptor,
+        &mut network_client,
+        peer.to_string().into(),
+        ctx.pub_key.clone(),
+        None,
+        |delegated| async move {
+            authorize_ran_inner.set(true);
+            let username = delegated.username.account_name().to_owned();
+            let domain = delegated.username.domain_name().unwrap_or_default().to_owned();
+            let ok = task::spawn_blocking(move || auth.authorize(peer_ip, &username, &domain, delegated.password.as_ref()))
+                .await
+                .unwrap_or(false);
+            authenticated_inner.set(ok);
+            ok
+        },
+    );
+    let Ok(result) = tokio::time::timeout(CREDSSP_TIMEOUT, credssp).await else {
+        if !authorize_ran.get() {
+            report_handshake_failed(&ctx.auth, peer_ip).await;
+        }
+        bail!("CredSSP timed out");
+    };
+    if let Err(error) = result {
+        if !authorize_ran.get() {
+            let auth = Arc::clone(&ctx.auth);
+            let _ = task::spawn_blocking(move || auth.auth_failed(peer_ip)).await;
+        }
+        return Err(error).context("NLA authentication failed");
+    }
+
+    Ok(Handshaked { framed, acceptor, peer })
+}
+
+/// Detects dead peers (phone out of range) instead of holding the session forever.
+fn set_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    if let Err(error) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        debug!(%error, "Failed to enable TCP keepalive");
+    }
+}
+
+fn log_session_end(peer: SocketAddr, result: Result<()>) {
+    if let Err(error) = result {
+        let err_str = format!("{error:#}");
+        if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
+            warn!(%peer, "Client disconnected: {err_str}");
+        } else {
+            error!(%peer, error = err_str, "Connection error");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::KeyboardEvent;
+
+    struct Recorder(Arc<std::sync::Mutex<Vec<u16>>>);
+
+    impl RdpServerInputHandler for Recorder {
+        fn keyboard(&mut self, _event: KeyboardEvent) {}
+
+        fn mouse(&mut self, event: MouseEvent) {
+            if let MouseEvent::Move { x, .. } = event {
+                self.0.lock().expect("recorder lock").push(x);
+            }
+        }
+    }
+
+    struct LayoutRecorder(Arc<std::sync::Mutex<Vec<u32>>>);
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for LayoutRecorder {
+        async fn size(&mut self) -> DesktopSize {
+            DesktopSize { width: 0, height: 0 }
+        }
+
+        async fn updates(&mut self) -> Result<Box<dyn crate::display::RdpServerDisplayUpdates>> {
+            bail!("not used")
+        }
+
+        fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+            let width = layout.monitors()[0].dimensions().0;
+            self.0.lock().expect("recorder lock").push(width);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_layouts_apply_in_arrival_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let display: Box<dyn RdpServerDisplay> = Box::new(LayoutRecorder(Arc::clone(&seen)));
+        let display = Arc::new(Mutex::new(display));
+        let backend = DisplayControlBackend::new(Arc::clone(&display));
+        let expected: Vec<u32> = (0..100).map(|n| 200 + 2 * n).collect();
+        {
+            // Hold the display so every layout queues up behind it.
+            let _busy = display.lock().await;
+            for &width in &expected {
+                let layout = DisplayControlMonitorLayout::new_single_primary_monitor(width, 600, None, None)
+                    .expect("valid layout");
+                backend.monitor_layout(layout);
+            }
+        }
+
+        for _ in 0..200 {
+            if seen.lock().expect("recorder lock").len() == expected.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*seen.lock().expect("recorder lock"), expected);
+    }
+
+    fn display_control(seen: &Arc<std::sync::Mutex<Vec<u32>>>) -> DisplayControlChannel {
+        let display: Box<dyn RdpServerDisplay> = Box::new(LayoutRecorder(Arc::clone(seen)));
+        DisplayControlChannel { backend: DisplayControlBackend::new(Arc::new(Mutex::new(display))) }
+    }
+
+    #[tokio::test]
+    async fn display_control_open_sends_caps_for_one_monitor_up_to_8192_square() {
+        use dvc::DvcProcessor as _;
+        let mut channel = display_control(&Arc::default());
+        let msgs = channel.start(1).expect("start");
+        assert_eq!(msgs.len(), 1);
+        let bytes = encode_vec(msgs[0].as_ref()).expect("encode");
+        // MS-RDPEDISP 2.2.2.1: header (type 5, length 20), MaxNumMonitors, AreaFactorA, AreaFactorB.
+        let words: Vec<u32> = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().expect("u32"))).collect();
+        assert_eq!(words, [5, 20, 1, 8192, 8192]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn display_control_forwards_monitor_layouts() {
+        use dvc::DvcProcessor as _;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut channel = display_control(&seen);
+        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(1544, 816, Some(200), None).expect("layout");
+        let pdu = encode_vec(&ironrdp_displaycontrol::pdu::DisplayControlPdu::from(layout)).expect("encode");
+        assert!(channel.process(1, &pdu).expect("process").is_empty());
+        for _ in 0..200 {
+            if !seen.lock().expect("recorder lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*seen.lock().expect("recorder lock"), [1544]);
+    }
+
+    fn slot_ip(n: u8) -> IpAddr {
+        IpAddr::from([192, 0, 2, n])
+    }
+
+    fn occupy(slots: &mut HandshakeSlots, ip: IpAddr) -> (u64, Rc<Cell<bool>>) {
+        let authenticated = Rc::new(Cell::new(false));
+        let id = slots.insert(ip, Rc::clone(&authenticated), AbortHandle::new_pair().0);
+        (id, authenticated)
+    }
+
+    #[test]
+    fn a_full_ip_evicts_its_own_oldest_unauthenticated_handshake() {
+        let mut slots = HandshakeSlots::default();
+        let (first, _) = occupy(&mut slots, slot_ip(1));
+        occupy(&mut slots, slot_ip(1));
+        // A client's idle probe from a moment ago must not refuse its real connection.
+        assert_eq!(slots.admit(slot_ip(1)), Admission::AcceptEvicting(first));
+        assert_eq!(slots.admit(slot_ip(2)), Admission::Accept);
+    }
+
+    #[test]
+    fn a_full_ip_of_authenticated_handshakes_refuses() {
+        let mut slots = HandshakeSlots::default();
+        occupy(&mut slots, slot_ip(1)).1.set(true);
+        occupy(&mut slots, slot_ip(1)).1.set(true);
+        assert_eq!(slots.admit(slot_ip(1)), Admission::Refuse);
+    }
+
+    #[test]
+    fn full_slots_evict_the_oldest_unauthenticated_handshake() {
+        let mut slots = HandshakeSlots::default();
+        let mut ids = Vec::new();
+        for n in 0..MAX_HANDSHAKES {
+            ids.push(occupy(&mut slots, slot_ip(u8::try_from(n / 2).expect("small"))));
+        }
+        // The oldest one already authenticated: it is about to become the session.
+        ids[0].1.set(true);
+        assert_eq!(slots.admit(slot_ip(100)), Admission::AcceptEvicting(ids[1].0));
+    }
+
+    #[test]
+    fn full_slots_of_authenticated_handshakes_refuse() {
+        let mut slots = HandshakeSlots::default();
+        for n in 0..MAX_HANDSHAKES {
+            occupy(&mut slots, slot_ip(u8::try_from(n / 2).expect("small"))).1.set(true);
+        }
+        assert_eq!(slots.admit(slot_ip(100)), Admission::Refuse);
+    }
+
+    #[test]
+    fn removing_a_handshake_frees_its_slot_and_ip_count() {
+        let mut slots = HandshakeSlots::default();
+        let (first, _) = occupy(&mut slots, slot_ip(1));
+        occupy(&mut slots, slot_ip(1));
+        assert!(slots.remove(first).is_some());
+        assert!(slots.remove(first).is_none());
+        assert_eq!(slots.admit(slot_ip(1)), Admission::Accept);
+    }
+
+    #[tokio::test]
+    async fn mouse_worker_keeps_event_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler: Box<dyn RdpServerInputHandler> = Box::new(Recorder(Arc::clone(&seen)));
+        let tx = spawn_mouse_worker(Arc::new(Mutex::new(handler)));
+        for x in 0..200u16 {
+            tx.send(MouseEvent::Move { x, y: 0 }).expect("worker alive");
+        }
+        drop(tx);
+
+        for _ in 0..200 {
+            if seen.lock().expect("recorder lock").len() == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected: Vec<u16> = (0..200).collect();
+        assert_eq!(*seen.lock().expect("recorder lock"), expected);
     }
 }
