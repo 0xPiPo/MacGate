@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- A pointer driven from afar: the cursor with two arcs radiating from its tip. -->
+  <path fill="#FFFFFF" stroke="#FFFFFF" stroke-width="22" stroke-linejoin="round"
+        d="M500 440V630L552 584L582 649L606 638L578 575H643Z"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round">
+    <path d="M413.1 409.8A70 70 0 0 1 469.8 353.1"/>
+    <path d="M361.9 400.8A122 122 0 0 1 460.8 301.9"/>
+  </g>
+</svg>

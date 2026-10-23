@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Monitor bezel with the screen cut out, plus neck and foot. -->
+  <path fill="#FFFFFF" fill-rule="evenodd" d="M264 236h496a64 64 0 0 1 64 64v352a64 64 0 0 1-64 64H264a64 64 0 0 1-64-64V300a64 64 0 0 1 64-64Zm20 44a40 40 0 0 0-40 40v312a40 40 0 0 0 40 40h456a40 40 0 0 0 40-40V320a40 40 0 0 0-40-40Z"/>
+  <path fill="#FFFFFF" d="M466 716h92l10 62h-112Z"/>
+  <rect fill="#FFFFFF" x="372" y="772" width="280" height="40" rx="20"/>
+</svg>
