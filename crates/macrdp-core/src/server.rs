@@ -17,26 +17,28 @@ pub fn resolve_resolution(
     logical_w: u16,
     logical_h: u16,
 ) -> (u16, u16) {
-    if res_mode == "auto" {
+    // u32 math, then clamped: a config value can never overflow u16 or exceed 8192.
+    let (w, h) = if res_mode == "auto" {
         let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
         tracing::info!(scale, logical_w, logical_h, "Resolution auto: display scale");
-        (logical_w * scale as u16, logical_h * scale as u16)
+        (logical_w as u32 * scale, logical_h as u32 * scale)
     } else if let Some((w, h)) = parse_resolution(res_mode) {
         tracing::info!(w, h, "Resolution: explicit WxH");
-        (w as u16, h as u16)
+        (w, h)
     } else if let Ok(scale) = res_mode.parse::<u32>() {
         // Legacy hidpi_scale: 1, 2, 3, 4 → multiply logical resolution
         let scale = scale.max(1).min(4);
         let (w, h) = (logical_w as u32 * scale, logical_h as u32 * scale);
         tracing::info!(scale, w, h, logical_w, logical_h, "Resolution: legacy hidpi_scale → {}x{}", w, h);
-        (w as u16, h as u16)
+        (w, h)
     } else {
         tracing::warn!(res_mode, "Resolution: unrecognized value, using logical resolution");
-        (logical_w, logical_h)
-    }
+        (logical_w as u32, logical_h as u32)
+    };
+    crate::resolution::clamp_desktop_size(w, h)
 }
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -64,6 +66,7 @@ pub struct ServerHandle {
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
     config_tx: tokio::sync::mpsc::UnboundedSender<ConfigUpdate>,
+    session_events: SessionEvents,
 }
 
 impl ServerHandle {
@@ -107,12 +110,20 @@ impl ServerHandle {
             last_frame_bytes: gfx.last_frame_bytes,
             network_quality: gfx.network_quality,
             pending_acks: gfx.pending_acks,
+            ..Default::default()
         }
     }
 
     /// Push a hot config update to the running server.
     pub fn update_config(&self, update: ConfigUpdate) {
         let _ = self.config_tx.send(update);
+    }
+
+    /// Ends the active session, if any; the listener keeps running.
+    pub fn disconnect(&self) {
+        if let Some(tx) = self.session_events.lock().unwrap().as_ref() {
+            let _ = tx.send(ironrdp_server::ServerEvent::Disconnect);
+        }
     }
 
     /// Gracefully stop the server.
@@ -152,7 +163,8 @@ impl Drop for ServerHandle {
 /// RdpServer itself is !Send, so we pass everything needed to construct it.
 struct ServerThreadArgs {
     config: ServerConfig,
-    bind_addr: SocketAddr,
+    listener: TcpListener,
+    authenticator: Arc<dyn ironrdp_server::RdpAuthenticator>,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
     width: u16,
@@ -165,41 +177,12 @@ struct ServerThreadArgs {
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
     config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
+    session_tx: tokio::sync::watch::Sender<bool>,
+    session_events: SessionEvents,
 }
 
-/// Try to bind to the given address. If the port is in use, try the next 99 ports.
-/// Returns the successfully bound TcpListener and the actual port.
-fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, u16)> {
-    for offset in 0..100u16 {
-        let port = preferred_port.checked_add(offset)
-            .context("Port number overflow")?;
-        let bind_addr = format!("{addr}:{port}");
-        match TcpListener::bind(&bind_addr) {
-            Ok(listener) => {
-                if offset > 0 {
-                    tracing::warn!(
-                        preferred = preferred_port,
-                        actual = port,
-                        "Preferred port in use, using alternative"
-                    );
-                }
-                return Ok((listener, port));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                tracing::debug!(port, "Port in use, trying next");
-                continue;
-            }
-            Err(e) => {
-                return Err(e).context(format!("Failed to bind to {bind_addr}"));
-            }
-        }
-    }
-    anyhow::bail!(
-        "No available port found in range {}-{}",
-        preferred_port,
-        preferred_port + 99
-    )
-}
+/// The running server's event sender, set once the server is built.
+type SessionEvents = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>>>>;
 
 /// Start the RDP server with the given configuration and event handler.
 /// Returns a handle to control the running server.
@@ -208,6 +191,7 @@ pub async fn start_server(
     handler: impl ServerEventHandler,
 ) -> Result<Arc<ServerHandle>> {
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
+    macrdp_capture::ddc::wake_if_left_asleep();
 
     // Notify handler: starting
     handler.on_status_change(ServerStatus {
@@ -216,26 +200,39 @@ pub async fn start_server(
         uptime_secs: 0,
     });
 
-    // Check and request permissions
-    let perms = permissions::request_permissions();
+    // Check only: prompting is the caller's call (the app asks during onboarding, the CLI
+    // before starting), so starting never pops a system dialog.
+    let perms = permissions::check_permissions();
     tracing::info!(?perms, "Permission status");
+
+    let shield_handler = Arc::clone(&handler);
+    macrdp_capture::virtual_display::set_shield_hook(Some(Box::new(move |displays: &[u32]| {
+        shield_handler.on_shield_displays(displays.to_vec());
+    })));
 
     // TLS
     let (cert_path, key_path) =
         tls::ensure_tls_files(config.cert_path.as_deref(), config.key_path.as_deref())?;
+    match tls::cert_fingerprint(&cert_path) {
+        Ok(fp) => tracing::info!(fingerprint = %fp, "TLS certificate SHA-256 — compare with the client's certificate prompt"),
+        Err(e) => tracing::warn!("Cannot compute the TLS certificate fingerprint: {e:#}"),
+    }
 
-    // Display detection — SCK for capture sizing, CG for mouse mapping
+    // Display detection — SCK for capture sizing, CG for mouse mapping. Without Screen
+    // Recording access SCK is skipped (it would prompt) and the CG size stands in.
+    let cg_size = macrdp_capture::detect_cg_display_size();
     let (sck_w, sck_h) = match permissions::detect_display_size() {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "SCK logical display size");
             (w as u16, h as u16)
         }
         Err(e) => {
-            tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
+            let (w, h) = cg_size.as_ref().map_or((1920, 1080), |&(w, h)| (w as u16, h as u16));
+            tracing::warn!("Failed to detect SCK display size: {e}, using {w}x{h}");
+            (w, h)
         }
     };
-    let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
+    let (cg_w, cg_h) = match cg_size {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
             (w as u16, h as u16)
@@ -274,21 +271,26 @@ pub async fn start_server(
     let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
 
     // GFX state (shared between server thread and metrics task)
-    let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
+    let mut gfx = GfxState::new(width, height, mode_444);
+    gfx.set_rfx_quality(config.rfx_quality.as_deref());
+    let gfx_state = Arc::new(Mutex::new(gfx));
 
-    let (listener, port) = find_available_port("0.0.0.0", config.port)?;
-    let bind_addr = listener.local_addr()?;
-    // Drop listener so the RDP server can rebind the same port.
-    // IronRDP's RdpServer::with_addr() binds its own socket; we cannot pass
-    // a pre-bound TcpListener. The TOCTOU window is microsecond-level.
-    drop(listener);
+    // A busy port is an error: clients are configured for one port, never a neighbour.
+    let listener = TcpListener::bind((config.bind_address.as_str(), config.port))
+        .with_context(|| format!("Cannot listen on {}:{}", config.bind_address, config.port))?;
+    let port = listener.local_addr()?.port();
+
+    let authenticator = mac_authenticator(config.auto_unlock)?;
     let shutdown_notify = Arc::new(Notify::new());
     let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel::<ConfigUpdate>();
+    let (session_tx, session_rx) = tokio::sync::watch::channel(false);
+    let session_events = Arc::new(Mutex::new(None));
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
         config: config.clone(),
-        bind_addr,
+        listener,
+        authenticator,
         cert_path,
         key_path,
         width,
@@ -301,6 +303,8 @@ pub async fn start_server(
         shutdown_notify: Arc::clone(&shutdown_notify),
         handler: Arc::clone(&handler),
         config_rx,
+        session_tx,
+        session_events: Arc::clone(&session_events),
     };
 
     // Spawn RDP server on a dedicated OS thread.
@@ -313,48 +317,8 @@ pub async fn start_server(
         })
         .context("Failed to spawn RDP server thread")?;
 
-    // Spawn metrics ticker (1 second interval) — all types here are Send
-    let metrics_gfx = Arc::clone(&gfx_state);
-    let handler_for_metrics = Arc::clone(&handler);
-    let fps = config.frame_rate;
-    let metrics_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut prev_bytes_sent: u64 = 0;
-        loop {
-            interval.tick().await;
-            let (rtt_ms, bytes_sent, encode_ms, last_frame_bytes, network_quality, pending_acks) = {
-                let gfx = metrics_gfx.lock().unwrap();
-                (
-                    gfx.rtt_ewma_ms,
-                    gfx.total_bytes_sent,
-                    gfx.last_encode_ms,
-                    gfx.last_frame_bytes,
-                    gfx.network_quality,
-                    gfx.pending_acks,
-                )
-            };
-            let delta_bytes = bytes_sent.saturating_sub(prev_bytes_sent);
-            prev_bytes_sent = bytes_sent;
-            let bitrate_kbps = delta_bytes * 8 / 1000;
-            let net_ms = (rtt_ms - encode_ms).max(0.0);
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            handler_for_metrics.on_metrics(Metrics {
-                fps,
-                bitrate_kbps,
-                rtt_ms,
-                bytes_sent,
-                timestamp,
-                encode_ms,
-                net_ms,
-                last_frame_bytes,
-                network_quality,
-                pending_acks,
-            });
-        }
-    });
+    // Metrics ticker: 1 s, and only while a session runs (no timer at all when idle).
+    let metrics_task = tokio::spawn(metrics_loop(Arc::clone(&gfx_state), Arc::clone(&handler), config.frame_rate, session_rx));
 
     let handle = Arc::new(ServerHandle {
         port,
@@ -365,6 +329,7 @@ pub async fn start_server(
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
         config_tx,
+        session_events,
     });
 
     // Notify handler: running
@@ -383,7 +348,7 @@ pub async fn start_server(
 fn run_server_thread(args: ServerThreadArgs) {
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
-    use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
+    use ironrdp_server::{RdpServer, TlsIdentityCtx};
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -423,18 +388,14 @@ fn run_server_thread(args: ServerThreadArgs) {
         // Create input handler (clone coord_mapper — shared with display for resize sync)
         let input_handler = MacInputHandler::new(args.coord_mapper.clone());
 
-        // Audio setup — shared sender slot, recreated per connection by AudioFactory
-        let shared_audio_tx = if args.config.audio.enabled {
-            Some(macrdp_audio::new_shared_audio_tx())
-        } else {
-            None
-        };
+        // Audio: captured only while a client has RDPSND open (published through the tap).
+        let audio_tap = args.config.audio.enabled.then(macrdp_audio::new_audio_tap);
 
         // Create audio factory
         let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
-            if let Some(ref shared_tx) = shared_audio_tx {
+            if let Some(ref tap) = audio_tap {
                 Some(Box::new(macrdp_audio::MacAudioFactory::new(
-                    shared_tx.clone(),
+                    Arc::clone(tap),
                     args.config.audio.sample_rate,
                     args.config.audio.channels,
                 )))
@@ -459,11 +420,17 @@ fn run_server_thread(args: ServerThreadArgs) {
         let fixed_resolution = (args.config.width > 0 && args.config.height > 0) || res_fixed;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
         let show_cursor = args.config.show_cursor.unwrap_or(true);
+        macrdp_capture::virtual_display::set_curtain_standby_ok(args.config.curtain_standby_ok == Some(true));
+        macrdp_capture::virtual_display::set_curtain_standby_keepalive(args.config.curtain_standby_keepalive);
+        let display_mode = Arc::new(Mutex::new(macrdp_capture::virtual_display::DisplayMode::from_config(
+            args.config.display_mode.as_deref(),
+        )));
         let display = MacDisplay::new(
             args.width,
             args.height,
             fixed_resolution,
-            args.config.frame_rate,
+            // 0 would be an invalid ScreenCaptureKit frame interval.
+            args.config.frame_rate.clamp(1, 120),
             args.quality,
             args.encoder_pref,
             args.mode_444,
@@ -471,13 +438,38 @@ fn run_server_thread(args: ServerThreadArgs) {
             bitrate_override,
             Arc::clone(&args.gfx_state),
             args.coord_mapper,
-            shared_audio_tx,
+            audio_tap,
             None, // perf_stats: not exposed via macrdp-core API yet
-        );
+        )
+        .with_display_mode(Arc::clone(&display_mode));
 
         // Build RDP server (this is the !Send type)
+        let bind_addr = match args.listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::error!("Listener has no local address: {e}");
+                return;
+            }
+        };
+        let listener = match args
+            .listener
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::TcpListener::from_std(args.listener))
+        {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::error!("Failed to register listener: {e}");
+                args.handler.on_status_change(ServerStatus {
+                    running: false,
+                    state: format!("error: {e}"),
+                    uptime_secs: 0,
+                });
+                return;
+            }
+        };
+
         let mut server = RdpServer::builder()
-            .with_addr(args.bind_addr)
+            .with_addr(bind_addr)
             .with_hybrid(tls_acceptor, tls_identity.pub_key)
             .with_input_handler(input_handler)
             .with_display_handler(display)
@@ -487,55 +479,28 @@ fn run_server_thread(args: ServerThreadArgs) {
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));
 
-        // Credentials
-        let (username, password) = match (&args.config.username, &args.config.password) {
-            (Some(u), Some(p)) => (u.clone(), p.clone()),
-            _ => {
-                let seed = std::process::id() as u64
-                    ^ std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as u64;
-                let random_pass: String = (0..8)
-                    .map(|i| {
-                        let v = ((seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(i * 1442695040888963407))
-                            >> (i * 5 + 3))
-                            % 36;
-                        if v < 10 {
-                            (b'0' + v as u8) as char
-                        } else {
-                            (b'a' + (v - 10) as u8) as char
-                        }
-                    })
-                    .collect();
-                let user = "macrdp".to_string();
-                tracing::warn!("No credentials in config — using generated credentials:");
-                println!("\n  ┌──────────────────────────────────┐");
-                println!("  │  Username: {:<22}│", &user);
-                println!("  │  Password: {:<22}│", &random_pass);
-                println!("  └──────────────────────────────────┘\n");
-                (user, random_pass)
-            }
-        };
-        server.set_credentials(Some(Credentials {
-            username: username.clone(),
-            password: password.clone(),
-            domain: None,
+        server.set_authenticator(args.authenticator);
+        server.set_session_lifecycle(Arc::new(ReportingLifecycle {
+            inner: Arc::new(crate::lifecycle::MacSessionLifecycle::new(args.config.lock_on_disconnect, args.config.auto_unlock)),
+            handler: Arc::clone(&args.handler),
+            gfx_state: Arc::clone(&args.gfx_state),
+            session: args.session_tx,
         }));
-        tracing::info!("Authentication configured for user: {}", username);
+        *args.session_events.lock().unwrap() = Some(server.event_sender().clone());
+        let idle = args.config.idle_timeout_secs;
+        server.set_idle_timeout((idle > 0).then(|| std::time::Duration::from_secs(idle)));
 
-        tracing::info!(%args.bind_addr, "RDP server listening");
+        tracing::info!(%bind_addr, "RDP server listening (NLA only)");
 
         // Spawn config hot-update listener
         let gfx_for_config = Arc::clone(&args.gfx_state);
-        let ev_sender = server.event_sender().clone();
+        let mode_for_config = Arc::clone(&display_mode);
         tokio::task::spawn_local(async move {
             while let Some(update) = config_rx.recv().await {
                 match update {
                     ConfigUpdate::FrameRate(fps) => {
                         tracing::info!(fps, "Hot-update: frame_rate (next connection)");
+                        gfx_for_config.lock().unwrap().next_frame_rate = Some(fps);
                     }
                     ConfigUpdate::BitrateKbps(kbps) => {
                         let bps = kbps * 1000;
@@ -562,18 +527,29 @@ fn run_server_thread(args: ServerThreadArgs) {
                         tracing::info!(%mode, avc444, "Hot-update: chroma_mode (next connection)");
                         gfx_for_config.lock().unwrap().chroma_mode = Some(mode);
                     }
-                    ConfigUpdate::Credentials { username, password } => {
-                        tracing::info!(%username, "Hot-update: credentials");
-                        let _ = ev_sender.send(ironrdp_server::ServerEvent::SetCredentials(
-                            ironrdp_server::Credentials { username, password, domain: None }
-                        ));
+                    ConfigUpdate::RfxQuality(q) => {
+                        tracing::info!(rfx_quality = %q, "Hot-update: rfx_quality (next frame)");
+                        gfx_for_config.lock().unwrap().set_rfx_quality(Some(q.as_str()));
+                    }
+                    ConfigUpdate::DisplayMode(mode) => {
+                        let mode = macrdp_capture::virtual_display::DisplayMode::from_config(Some(mode.as_str()));
+                        tracing::info!(?mode, "Hot-update: display_mode (next connection)");
+                        *mode_for_config.lock().unwrap() = mode;
+                    }
+                    ConfigUpdate::CurtainStandbyOk(ok) => {
+                        tracing::info!(ok, "Hot-update: curtain_standby_ok (next connection)");
+                        macrdp_capture::virtual_display::set_curtain_standby_ok(ok);
+                    }
+                    ConfigUpdate::CurtainStandbyKeepalive(on) => {
+                        tracing::info!(on, "Hot-update: curtain_standby_keepalive (next connection)");
+                        macrdp_capture::virtual_display::set_curtain_standby_keepalive(on);
                     }
                 }
             }
         });
 
         tokio::select! {
-            result = server.run() => {
+            result = server.run_on(listener) => {
                 if let Err(e) = result {
                     tracing::error!("RDP server error: {e}");
                     args.handler.on_status_change(ServerStatus {
@@ -588,4 +564,264 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         }
     });
+}
+
+/// Reports metrics once a second while `session` is true; with no session it waits on the
+/// watch channel only, so an idle server runs no timer.
+async fn metrics_loop(
+    gfx_state: Arc<Mutex<GfxState>>,
+    handler: Arc<dyn ServerEventHandler>,
+    fps: u32,
+    mut session: tokio::sync::watch::Receiver<bool>,
+) {
+    let period = std::time::Duration::from_secs(1);
+    loop {
+        if session.wait_for(|active| *active).await.is_err() {
+            return;
+        }
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        let mut prev_bytes_sent = gfx_state.lock().unwrap().total_bytes_sent;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                changed = session.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if !*session.borrow_and_update() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            let mut metrics = {
+                let gfx = gfx_state.lock().unwrap();
+                Metrics {
+                    fps,
+                    rtt_ms: gfx.rtt_ewma_ms,
+                    bytes_sent: gfx.total_bytes_sent,
+                    encode_ms: gfx.last_encode_ms,
+                    net_ms: (gfx.rtt_ewma_ms - gfx.last_encode_ms).max(0.0),
+                    last_frame_bytes: gfx.last_frame_bytes,
+                    network_quality: gfx.network_quality,
+                    pending_acks: gfx.pending_acks,
+                    client_name: gfx.client_name.as_deref().map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()),
+                    width: gfx.width,
+                    height: gfx.height,
+                    codec: session_codec(&gfx).map(str::to_string),
+                    rfx_quality: (session_codec(&gfx) == Some("rfx-progressive")).then(|| gfx.rfx_quality.as_str().to_string()),
+                    ..Default::default()
+                }
+            };
+            // A new session resets the byte counter.
+            metrics.bitrate_kbps = metrics.bytes_sent.saturating_sub(prev_bytes_sent) * 8 / 1000;
+            prev_bytes_sent = metrics.bytes_sent;
+            metrics.timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            handler.on_metrics(metrics);
+        }
+    }
+}
+
+/// The GFX codec the display pipeline uses once caps are confirmed (see `display::route`).
+fn session_codec(gfx: &GfxState) -> Option<&'static str> {
+    if gfx.avc_ready() {
+        Some("avc420")
+    } else if gfx.is_ready() {
+        Some("rfx-progressive")
+    } else {
+        None
+    }
+}
+
+/// Wraps the Mac lifecycle: reports connects and disconnects to the handler and drives the
+/// session flag the metrics ticker waits on.
+struct ReportingLifecycle {
+    inner: Arc<dyn ironrdp_server::SessionLifecycle>,
+    handler: Arc<dyn ServerEventHandler>,
+    gfx_state: Arc<Mutex<GfxState>>,
+    session: tokio::sync::watch::Sender<bool>,
+}
+
+impl ironrdp_server::SessionLifecycle for ReportingLifecycle {
+    fn session_started(&self, peer: std::net::SocketAddr) -> Box<dyn ironrdp_server::SessionGuard> {
+        let inner = self.inner.session_started(peer);
+        self.session.send_replace(true);
+        self.handler.on_connection(ConnectionEvent::Connected(ConnectionInfo {
+            client_ip: peer.ip().to_string(),
+            client_name: String::new(),
+            connected_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }));
+        Box::new(ReportingGuard {
+            inner: Some(inner),
+            peer,
+            started: Instant::now(),
+            handler: Arc::clone(&self.handler),
+            gfx_state: Arc::clone(&self.gfx_state),
+            session: self.session.clone(),
+        })
+    }
+}
+
+struct ReportingGuard {
+    inner: Option<Box<dyn ironrdp_server::SessionGuard>>,
+    peer: std::net::SocketAddr,
+    started: Instant,
+    handler: Arc<dyn ServerEventHandler>,
+    gfx_state: Arc<Mutex<GfxState>>,
+    session: tokio::sync::watch::Sender<bool>,
+}
+
+impl ironrdp_server::SessionGuard for ReportingGuard {
+    fn replaced(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.replaced();
+        }
+    }
+}
+
+impl Drop for ReportingGuard {
+    fn drop(&mut self) {
+        // The Mac side (screen restore, lock) finishes before the session is reported over.
+        drop(self.inner.take());
+        self.session.send_replace(false);
+        let bytes_total = self.gfx_state.lock().map(|g| g.total_bytes_sent).unwrap_or(0);
+        self.handler.on_connection(ConnectionEvent::Disconnected(DisconnectionInfo {
+            client_ip: self.peer.ip().to_string(),
+            client_name: String::new(),
+            duration_secs: self.started.elapsed().as_secs(),
+            bytes_total,
+        }));
+    }
+}
+
+/// Only the Mac user running macrdp may connect, with the enrolled Mac password.
+fn mac_authenticator(auto_unlock: bool) -> Result<Arc<dyn ironrdp_server::RdpAuthenticator>> {
+    use crate::auth;
+
+    let user = auth::current_user()?;
+    let authenticator = auth::MacAuthenticator::new(user.clone(), auth::host_names(), Arc::new(auth::SystemAccountStore))
+        .with_auto_unlock(auto_unlock);
+    // The only Keychain read until an enroll: TCP connects use the cached hash.
+    if authenticator.preload() {
+        tracing::info!(user = %user, "Remote login enabled for Mac account");
+    } else {
+        tracing::warn!(
+            user = %user,
+            "No Mac password enrolled — remote login is refused until you run `macrdp-server enroll` or enroll in the app"
+        );
+    }
+    Ok(Arc::new(authenticator))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Recorder {
+        metrics: Mutex<Vec<Metrics>>,
+        connections: Mutex<Vec<ConnectionEvent>>,
+    }
+
+    impl ServerEventHandler for Arc<Recorder> {
+        fn on_metrics(&self, metrics: Metrics) {
+            self.metrics.lock().unwrap().push(metrics);
+        }
+        fn on_connection(&self, event: ConnectionEvent) {
+            self.connections.lock().unwrap().push(event);
+        }
+    }
+
+    fn gfx() -> Arc<Mutex<GfxState>> {
+        Arc::new(Mutex::new(GfxState::new(1920, 1080, false)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_tick_only_during_a_session() {
+        let rec = Arc::new(Recorder::default());
+        let (session_tx, session_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(metrics_loop(gfx(), Arc::new(Arc::clone(&rec)), 30, session_rx));
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(rec.metrics.lock().unwrap().len(), 0, "no metrics while idle");
+
+        session_tx.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let during = rec.metrics.lock().unwrap().len();
+        assert!((2..=4).contains(&during), "about one per second in a session, got {during}");
+
+        session_tx.send_replace(false);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let after_end = rec.metrics.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(rec.metrics.lock().unwrap().len(), after_end, "metrics stop when the session ends");
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_carry_session_details() {
+        let rec = Arc::new(Recorder::default());
+        let state = gfx();
+        {
+            let mut st = state.lock().unwrap();
+            st.channel_id = Some(1);
+            st.caps_confirmed = true;
+            st.avc420_supported = true;
+            st.client_name = Some("PIXEL\u{0}\n".to_string());
+        }
+        let (_session_tx, session_rx) = tokio::sync::watch::channel(true);
+        let task = tokio::spawn(metrics_loop(Arc::clone(&state), Arc::new(Arc::clone(&rec)), 30, session_rx));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let m = rec.metrics.lock().unwrap()[0].clone();
+        assert_eq!((m.width, m.height), (1920, 1080));
+        assert_eq!(m.codec.as_deref(), Some("avc420"));
+        assert_eq!(m.client_name.as_deref(), Some("PIXEL"), "control characters are stripped");
+        task.abort();
+    }
+
+    #[test]
+    fn codec_follows_the_negotiated_gfx_path() {
+        let mut st = GfxState::new(800, 600, false);
+        assert_eq!(session_codec(&st), None, "nothing before GFX caps are confirmed");
+        st.channel_id = Some(1);
+        st.caps_confirmed = true;
+        assert_eq!(session_codec(&st), Some("rfx-progressive"));
+        st.avc420_supported = true;
+        assert_eq!(session_codec(&st), Some("avc420"));
+    }
+
+    struct NoopLifecycle;
+    struct NoopGuard;
+    impl ironrdp_server::SessionGuard for NoopGuard {
+        fn replaced(&mut self) {}
+    }
+    impl ironrdp_server::SessionLifecycle for NoopLifecycle {
+        fn session_started(&self, _peer: std::net::SocketAddr) -> Box<dyn ironrdp_server::SessionGuard> {
+            Box::new(NoopGuard)
+        }
+    }
+
+    #[test]
+    fn sessions_are_reported_and_tracked() {
+        use ironrdp_server::SessionLifecycle as _;
+        let rec = Arc::new(Recorder::default());
+        let (session_tx, session_rx) = tokio::sync::watch::channel(false);
+        let lifecycle = ReportingLifecycle {
+            inner: Arc::new(NoopLifecycle),
+            handler: Arc::new(Arc::clone(&rec)),
+            gfx_state: gfx(),
+            session: session_tx,
+        };
+        let guard = lifecycle.session_started("192.0.2.7:50000".parse().unwrap());
+        assert!(*session_rx.borrow());
+        drop(guard);
+        assert!(!*session_rx.borrow());
+        let events = rec.connections.lock().unwrap();
+        assert!(matches!(&events[0], ConnectionEvent::Connected(i) if i.client_ip == "192.0.2.7"));
+        assert!(matches!(&events[1], ConnectionEvent::Disconnected(i) if i.client_ip == "192.0.2.7"));
+    }
 }

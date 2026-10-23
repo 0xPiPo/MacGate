@@ -45,6 +45,30 @@ pub fn request_permissions() -> PermissionStatus {
     check_permissions()
 }
 
+/// Shows the system prompt for one permission: `"screen"` or `"accessibility"`.
+pub fn request_permission(which: &str) -> anyhow::Result<()> {
+    match which {
+        "screen" => {
+            macrdp_capture::request_screen_recording_permission();
+        }
+        "accessibility" => {
+            macrdp_input::request_accessibility_permission();
+        }
+        other => anyhow::bail!("unknown permission {other:?}"),
+    }
+    Ok(())
+}
+
+/// Opens the System Settings privacy pane for `"screen"` or `"accessibility"`.
+pub fn open_privacy_settings(which: &str) -> anyhow::Result<()> {
+    match which {
+        "screen" => macrdp_capture::open_screen_recording_settings(),
+        "accessibility" => macrdp_input::open_accessibility_settings(),
+        other => anyhow::bail!("unknown permission {other:?}"),
+    }
+    Ok(())
+}
+
 /// Detect the main display's logical pixel size
 pub fn detect_display_size() -> anyhow::Result<(u32, u32)> {
     macrdp_capture::detect_display_size()
