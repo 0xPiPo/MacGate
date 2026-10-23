@@ -1,6 +1,8 @@
 //! RDPGFX (Graphics Pipeline) DVC handler
 
+use core::time::Duration;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ironrdp_core::{encode_vec, impl_as_any, Encode, WriteCursor, EncodeResult};
 use ironrdp_dvc::{DvcEncode, DvcProcessor, DvcServerProcessor};
@@ -9,16 +11,17 @@ use ironrdp_pdu::rdp::vc::dvc::gfx::{
     Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
     CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
     CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
-    MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
-    ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
+    MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, QueueDepth, ResetGraphicsPdu,
+    ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu, Codec2Type, WireToSurface2Pdu,
 };
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::{decode, PduResult};
 
 type DvcMessage = ironrdp_dvc::DvcMessage;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
+use crate::display::{GfxFrameUpdate, GfxRemoteFxUpdate, GfxUncompressedUpdate};
+pub use crate::encoder::rfx::{encode_gfx_progressive, RfxQuality};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -82,6 +85,46 @@ fn wrap_zgfx(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Capability versions `ironrdp-pdu` 0.7 can decode (its `CapabilityVersion`).
+const KNOWN_CAPS_VERSIONS: [u32; 12] = [
+    0x8_0004, 0x8_0105, 0xa_0002, 0xa_0100, 0xa_0200, 0xa_0301, 0xa_0400, 0xa_0502, 0xa_0600, 0xa_0601,
+    0xa_0701, 0xa_0702,
+];
+
+/// Decodes a client GFX PDU. ironrdp-pdu rejects a whole CapsAdvertise when one set has a version
+/// it does not know; MS-RDPEGFX says the server ignores such sets, so retry with them removed.
+fn decode_client_pdu(data: &[u8]) -> ironrdp_core::DecodeResult<ClientPdu> {
+    let err = match decode::<ClientPdu>(data) {
+        Ok(pdu) => return Ok(pdu),
+        Err(e) => e,
+    };
+    const CAPS_ADVERTISE: u16 = 0x0012;
+    if data.len() < 10 || u16::from_le_bytes([data[0], data[1]]) != CAPS_ADVERTISE {
+        return Err(err);
+    }
+    let count = u16::from_le_bytes([data[8], data[9]]);
+    let (mut kept, mut sets, mut offset) = (0u16, Vec::new(), 10usize);
+    for _ in 0..count {
+        let Some(head) = data.get(offset..offset + 8) else { return Err(err) };
+        let version = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+        let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        let Some(set) = data.get(offset..offset + 8 + len) else { return Err(err) };
+        if KNOWN_CAPS_VERSIONS.contains(&version) {
+            sets.extend_from_slice(set);
+            kept += 1;
+        } else {
+            info!(version = format_args!("{version:#x}"), data = ?&set[8..], "GFX: skipping unknown capability set");
+        }
+        offset += 8 + len;
+    }
+    let mut pdu = Vec::with_capacity(10 + sets.len());
+    pdu.extend_from_slice(&data[0..4]);
+    pdu.extend_from_slice(&((10 + sets.len()) as u32).to_le_bytes());
+    pdu.extend_from_slice(&kept.to_le_bytes());
+    pdu.extend_from_slice(&sets);
+    decode(&pdu).map_err(|_| err)
+}
+
 /// Unwrap ZGFX segmented data from client. Returns None if not ZGFX-wrapped.
 fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
@@ -128,11 +171,114 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Outcome of a CapabilitiesAdvertise: the set to confirm and the AVC support it implies.
+#[derive(Debug)]
+pub struct NegotiatedCaps {
+    pub confirmed: CapabilitySet,
+    pub avc420: bool,
+    pub avc444: bool,
+}
+
+/// Version order of the sets ironrdp-pdu decodes (Unknown never wins).
+fn cap_rank(cap: &CapabilitySet) -> u8 {
+    match cap {
+        CapabilitySet::V8 { .. } => 1,
+        CapabilitySet::V8_1 { .. } => 2,
+        CapabilitySet::V10 { .. } => 3,
+        CapabilitySet::V10_1 => 4,
+        CapabilitySet::V10_2 { .. } => 5,
+        CapabilitySet::V10_3 { .. } => 6,
+        CapabilitySet::V10_4 { .. } => 7,
+        CapabilitySet::V10_5 { .. } => 8,
+        CapabilitySet::V10_6 { .. } => 9,
+        CapabilitySet::V10_6Err { .. } => 10,
+        CapabilitySet::V10_7 { .. } => 11,
+        CapabilitySet::Unknown(_) => 0,
+    }
+}
+
+/// Picks the capability set to confirm. AVC sets win; without AVC, the highest version advertised.
+pub fn negotiate_caps(cap_sets: &[CapabilitySet]) -> NegotiatedCaps {
+    let (mut avc420, mut avc444) = (false, false);
+    let mut best_cap = None;
+
+    for cap in cap_sets {
+        match cap {
+            CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
+                avc420 = true;
+                avc444 = true;
+                best_cap = Some(cap.clone());
+                break;
+            }
+            CapabilitySet::V10_6 { flags } | CapabilitySet::V10_6Err { flags }
+                if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
+            {
+                avc420 = true;
+                avc444 = true;
+                best_cap = Some(cap.clone());
+            }
+            CapabilitySet::V10_5 { flags } | CapabilitySet::V10_4 { flags }
+                if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
+            {
+                avc420 = true;
+                avc444 = true;
+                if best_cap.is_none() { best_cap = Some(cap.clone()); }
+            }
+            CapabilitySet::V10_3 { flags }
+                if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
+            {
+                avc420 = true;
+                avc444 = true;
+                if best_cap.is_none() { best_cap = Some(cap.clone()); }
+            }
+            CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
+                if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
+            {
+                avc420 = true;
+                avc444 = true;
+                if best_cap.is_none() { best_cap = Some(cap.clone()); }
+            }
+            CapabilitySet::V10_1 => {
+                // V10_1 has no AVC_DISABLED flag — always supports AVC
+                avc420 = true;
+                avc444 = true;
+                if best_cap.is_none() { best_cap = Some(cap.clone()); }
+            }
+            CapabilitySet::V8_1 { flags }
+                if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) =>
+            {
+                avc420 = true;
+                // V8.1 only supports AVC420, not AVC444
+                if best_cap.is_none() { best_cap = Some(cap.clone()); }
+            }
+            _ => {}
+        }
+    }
+
+    let confirmed = best_cap
+        .or_else(|| cap_sets.iter().filter(|c| cap_rank(c) > 0).max_by_key(|c| cap_rank(c)).cloned())
+        .unwrap_or(CapabilitySet::V8 {
+            flags: ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags::empty(),
+        });
+    NegotiatedCaps { confirmed, avc420, avc444 }
+}
+
 fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
     let data = encode_vec(pdu).map_err(|e| ironrdp_pdu::custom_err!("GfxEncode", e))?;
     let wrapped = wrap_zgfx(&data);
     Ok(Box::new(RawGfxPdu(wrapped)))
 }
+
+/// Frames that may be in flight unacknowledged, beyond the path's baseline in-flight
+/// (see `GfxState::baseline_in_flight`), before the encoder waits.
+pub const MAX_PENDING_ACKS: u32 = 2;
+
+/// Upper bound on the RTT-derived part of the gate (500 ms at 60 fps).
+const MAX_BASELINE_IN_FLIGHT: u32 = 30;
+
+/// With frames pending and no send or ack for this long, the gate reopens
+/// (and the next frame is an IDR) so a client that stops acking never freezes video.
+pub const ACK_STALL: Duration = Duration::from_secs(1);
 
 /// Shared state between GfxHandler and the server
 #[derive(Debug)]
@@ -151,14 +297,21 @@ pub struct GfxState {
     pub height: u16,
     /// Frames sent but not yet acknowledged
     pub pending_acks: u32,
+    /// Frames the encode pipeline handed over that `next_frame_id` has not counted yet: the
+    /// channel slot frees on receive, before the session counts the frame.
+    in_transit: u32,
     /// Last acknowledged frame ID
     pub last_ack_frame: u32,
     /// Network quality estimate (0.0 = congested, 1.0 = excellent)
     pub network_quality: f32,
     /// Send timestamps for RTT calculation (frame_id → Instant)
-    pub frame_send_times: std::collections::HashMap<u32, std::time::Instant>,
+    pub frame_send_times: std::collections::HashMap<u32, Instant>,
     /// Exponentially weighted moving average RTT in ms
     pub rtt_ewma_ms: f64,
+    /// Lowest RTT seen this session in ms (0 = none yet): the uncongested path delay.
+    rtt_min_ms: f64,
+    /// Target frame rate of the encode pipeline (0 = unknown), sizes the ack gate.
+    pub frame_rate: u32,
     /// Last frame encode time in ms
     pub last_encode_ms: f64,
     /// Last frame size in bytes
@@ -166,24 +319,46 @@ pub struct GfxState {
     /// Total bytes sent
     pub total_bytes_sent: u64,
     /// Time of first frame sent
-    pub start_time: Option<std::time::Instant>,
+    pub start_time: Option<Instant>,
     /// Client peer IP address (set after TCP connection is established)
     pub peer_addr: Option<std::net::IpAddr>,
+    /// Client GCC clientName of the active session (untrusted, client-chosen).
+    pub client_name: Option<String>,
     /// Instantaneous bitrate tracking (per-frame Mbps samples since last log)
     bitrate_samples: Vec<f64>,
     bitrate_max: f64,
     bitrate_min: f64,
-    last_frame_time: Option<std::time::Instant>,
+    last_frame_time: Option<Instant>,
     /// Hot-updatable: target bitrate override (set via ConfigUpdate)
     pub target_bitrate: Option<u32>,
-    /// Hot-updatable: show cursor flag (set via ConfigUpdate)
+    /// Hot-updatable: show cursor flag (set via ConfigUpdate), taken by the next session
     pub show_cursor: Option<bool>,
+    /// Hot-updatable: frame rate (set via ConfigUpdate), taken by the next session
+    pub next_frame_rate: Option<u32>,
     /// Hot-updatable: resolution (set via ConfigUpdate)
     pub resolution: Option<String>,
     /// Hot-updatable: encoder preference (set via ConfigUpdate)
     pub encoder_pref: Option<String>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
     pub chroma_mode: Option<String>,
+    /// Hot-updatable: RemoteFX quality, read for every RemoteFX frame (in auto mode, the
+    /// level the encode pipeline's controller chose last).
+    pub rfx_quality: RfxQuality,
+    /// `rfx_quality` follows the connection (config "auto", the default).
+    pub rfx_auto: bool,
+    /// Client sent QueueDepth::Suspend: it does not ack, so do not gate on acks.
+    acks_suspended: bool,
+    /// Next encoded frame must be an IDR (caps confirm, refresh request, stall recovery).
+    idr_requested: bool,
+    last_ack_time: Option<Instant>,
+    /// Signalled on every frame ack so the encode pipeline can re-check `can_send`.
+    pub ack_notify: Arc<tokio::sync::Notify>,
+    /// Signalled when capabilities are confirmed, so an idle pipeline picks its GFX path.
+    pub caps_notify: Arc<tokio::sync::Notify>,
+    /// RemoteFX Progressive codec context of the current surface; None until its first
+    /// message (which carries SYNC and CONTEXT), cleared when a surface is created.
+    progressive_context: Option<u32>,
+    next_codec_context: u32,
 }
 
 impl GfxState {
@@ -200,33 +375,51 @@ impl GfxState {
             width,
             height,
             pending_acks: 0,
+            in_transit: 0,
             last_ack_frame: 0,
             network_quality: 1.0,
             frame_send_times: std::collections::HashMap::new(),
             rtt_ewma_ms: 0.0,
+            rtt_min_ms: 0.0,
+            frame_rate: 0,
             last_encode_ms: 0.0,
             last_frame_bytes: 0,
             total_bytes_sent: 0,
             start_time: None,
             peer_addr: None,
+            client_name: None,
             bitrate_samples: Vec::new(),
             bitrate_max: 0.0,
             bitrate_min: f64::MAX,
             last_frame_time: None,
             target_bitrate: None,
             show_cursor: None,
+            next_frame_rate: None,
             resolution: None,
             encoder_pref: None,
             chroma_mode: None,
+            rfx_quality: RfxQuality::default(),
+            rfx_auto: true,
+            acks_suspended: false,
+            idr_requested: false,
+            last_ack_time: None,
+            ack_notify: Arc::new(tokio::sync::Notify::new()),
+            caps_notify: Arc::new(tokio::sync::Notify::new()),
+            progressive_context: None,
+            next_codec_context: 0,
         }
     }
 
     pub fn next_frame_id(&mut self) -> u32 {
         self.frame_id += 1;
-        self.pending_acks += 1;
+        self.in_transit = self.in_transit.saturating_sub(1);
+        // A suspended client never acks these frames; counting them would close the gate on resume.
+        if !self.acks_suspended {
+            self.pending_acks += 1;
+        }
         self.total_bytes_sent += self.last_frame_bytes as u64;
         if self.start_time.is_none() {
-            self.start_time = Some(std::time::Instant::now());
+            self.start_time = Some(Instant::now());
         }
         // Track instantaneous bitrate per frame
         if let Some(prev) = self.last_frame_time {
@@ -236,8 +429,8 @@ impl GfxState {
             if mbps > self.bitrate_max { self.bitrate_max = mbps; }
             if mbps < self.bitrate_min { self.bitrate_min = mbps; }
         }
-        self.last_frame_time = Some(std::time::Instant::now());
-        self.frame_send_times.insert(self.frame_id, std::time::Instant::now());
+        self.last_frame_time = Some(Instant::now());
+        self.frame_send_times.insert(self.frame_id, Instant::now());
         // Limit map size to prevent unbounded growth
         if self.frame_send_times.len() > 120 {
             let cutoff = self.frame_id.saturating_sub(120);
@@ -247,15 +440,23 @@ impl GfxState {
     }
 
     /// Update network quality and RTT based on frame acknowledgment
-    pub fn ack_frame(&mut self, ack_frame_id: u32) {
+    pub fn ack_frame(&mut self, ack_frame_id: u32, queue_depth: QueueDepth, now: Instant) {
         self.last_ack_frame = ack_frame_id;
-        if self.pending_acks > 0 {
-            self.pending_acks -= 1;
+        self.pending_acks = self.pending_acks.saturating_sub(1);
+        self.acks_suspended = queue_depth == QueueDepth::Suspend;
+        if self.acks_suspended {
+            self.pending_acks = 0;
         }
+        self.last_ack_time = Some(now);
+        // Notify stores a permit when nobody waits, so the wakeup is never lost.
+        self.ack_notify.notify_one();
 
         // Calculate RTT from send timestamp
         if let Some(send_time) = self.frame_send_times.remove(&ack_frame_id) {
-            let rtt_ms = send_time.elapsed().as_secs_f64() * 1000.0;
+            let rtt_ms = now.saturating_duration_since(send_time).as_secs_f64() * 1000.0;
+            if self.rtt_min_ms == 0.0 || rtt_ms < self.rtt_min_ms {
+                self.rtt_min_ms = rtt_ms;
+            }
             // EWMA with alpha=0.2 for smooth averaging
             if self.rtt_ewma_ms == 0.0 {
                 self.rtt_ewma_ms = rtt_ms;
@@ -278,13 +479,80 @@ impl GfxState {
         };
     }
 
+    /// Config `rfx_quality`: "low", "medium" or "high" fix the level; anything else (unset,
+    /// "auto") follows the connection, starting at medium.
+    pub fn set_rfx_quality(&mut self, value: Option<&str>) {
+        self.rfx_auto = !matches!(value, Some("low" | "medium" | "high"));
+        self.rfx_quality = RfxQuality::from_config(value);
+    }
+
+    /// Lowest RTT seen this session in ms (0 = none yet).
+    pub fn rtt_min_ms(&self) -> f64 {
+        self.rtt_min_ms
+    }
+
+    /// Frames in flight on an uncongested path: minimum RTT times the frame rate (bounded).
+    pub fn baseline_in_flight(&self) -> u32 {
+        // Truncation keeps LAN paths (under one frame interval) at the plain MAX_PENDING_ACKS gate.
+        let frames = self.rtt_min_ms * f64::from(self.frame_rate) / 1000.0;
+        (frames as u32).min(MAX_BASELINE_IN_FLIGHT)
+    }
+
+    /// Unacked frames beyond the path's baseline in-flight: queueing, i.e. congestion.
+    pub fn backlog(&self) -> u32 {
+        (self.pending_acks + self.in_transit).saturating_sub(self.baseline_in_flight())
+    }
+
+    /// The encode pipeline handed a GFX frame to the session (counted by `next_frame_id`).
+    pub fn frame_handed_off(&mut self) {
+        self.in_transit += 1;
+    }
+
     /// Get recommended bitrate based on network quality and base bitrate
     pub fn adaptive_bitrate(&self, base_bitrate: u32) -> u32 {
         (base_bitrate as f32 * self.network_quality) as u32
     }
 
+    /// Ack gate: may another frame be encoded and sent at `now`?
+    /// Reopens after ACK_STALL without progress (last send or ack) and requests an IDR.
+    pub fn can_send(&mut self, now: Instant) -> bool {
+        if self.acks_suspended || self.backlog() <= MAX_PENDING_ACKS {
+            return true;
+        }
+        let progress = match (self.last_frame_time, self.last_ack_time) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let stalled = progress.is_none_or(|p| now.saturating_duration_since(p) > ACK_STALL);
+        if !stalled {
+            return false;
+        }
+        warn!(pending = self.pending_acks, "GFX acks stalled; reopening gate with IDR");
+        self.pending_acks = 0;
+        // Also clears a frame the session dropped uncounted (GFX closed in between).
+        self.in_transit = 0;
+        self.frame_send_times.clear();
+        self.idr_requested = true;
+        true
+    }
+
+    pub fn request_idr(&mut self) {
+        self.idr_requested = true;
+    }
+
+    /// Returns true once per IDR request (requests coalesce).
+    pub fn take_idr_request(&mut self) -> bool {
+        core::mem::take(&mut self.idr_requested)
+    }
+
+    /// GFX channel open and capabilities confirmed: surface commands may be sent.
     pub fn is_ready(&self) -> bool {
-        self.channel_id.is_some() && self.avc420_supported && self.caps_confirmed
+        self.channel_id.is_some() && self.caps_confirmed
+    }
+
+    /// GFX ready and the client decodes AVC420 (H.264) surface commands.
+    pub fn avc_ready(&self) -> bool {
+        self.is_ready() && self.avc420_supported
     }
 }
 
@@ -359,6 +627,7 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
+            state.progressive_context = None;
             info!("GFX surface created: {}x{} (enc: {}x{})", state.width, state.height, enc_w, enc_h);
         }
 
@@ -467,23 +736,21 @@ impl GfxHandler {
         wrap_zgfx(&raw_pdus)
     }
 
-    /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
-    /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
-    /// First call also includes surface setup PDUs.
-    pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
-        let mut raw_pdus = Vec::new();
-
-        // Detect resolution change — rebuild surface
-        if state.surface_created
-            && (state.width != update.width || state.height != update.height)
-        {
+    /// Surface setup when needed (first frame, or the frame size changed), then StartFrame.
+    /// Before the first surface, adopt the frame size: ResetGraphics and CreateSurface must
+    /// both match the captured display. Returns the frame id.
+    fn begin_surface_frame(state: &mut GfxState, width: u16, height: u16, raw_pdus: &mut Vec<u8>) -> u32 {
+        if !state.surface_created {
+            state.width = width;
+            state.height = height;
+        } else if state.width != width || state.height != height {
             info!(
                 old_w = state.width, old_h = state.height,
-                new_w = update.width, new_h = update.height,
-                "GFX uncompressed resolution changed, rebuilding surface"
+                new_w = width, new_h = height,
+                "GFX resolution changed, rebuilding surface"
             );
-            state.width = update.width;
-            state.height = update.height;
+            state.width = width;
+            state.height = height;
             state.surface_created = false;
         }
 
@@ -505,8 +772,8 @@ impl GfxHandler {
 
             if let Ok(data) = encode_vec(&ServerPdu::CreateSurface(CreateSurfacePdu {
                 surface_id: 0,
-                width: update.width,
-                height: update.height,
+                width,
+                height,
                 pixel_format: GfxPixelFormat::XRgb,
             })) {
                 raw_pdus.extend_from_slice(&data);
@@ -521,12 +788,12 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
-            info!("GFX surface created (uncompressed): {}x{}", update.width, update.height);
+            state.progressive_context = None;
+            info!("GFX surface created: {}x{}", width, height);
         }
 
         let frame_id = state.next_frame_id();
 
-        // StartFrame
         if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
             timestamp: Timestamp {
                 milliseconds: 0,
@@ -538,6 +805,23 @@ impl GfxHandler {
         })) {
             raw_pdus.extend_from_slice(&data);
         }
+        frame_id
+    }
+
+    /// EndFrame for `frame_id`, then a single ZGFX wrap of the whole frame.
+    fn end_surface_frame(frame_id: u32, mut raw_pdus: Vec<u8>) -> Vec<u8> {
+        if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
+            raw_pdus.extend_from_slice(&data);
+        }
+        wrap_zgfx(&raw_pdus)
+    }
+
+    /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
+    /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
+    /// First call also includes surface setup PDUs.
+    pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
+        let mut raw_pdus = Vec::new();
+        let frame_id = Self::begin_surface_frame(state, update.width, update.height, &mut raw_pdus);
 
         // WireToSurface1 per dirty rect with Codec1Type::Uncompressed
         let mut total_bytes = 0usize;
@@ -559,11 +843,6 @@ impl GfxHandler {
             }
         }
 
-        // EndFrame
-        if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
-            raw_pdus.extend_from_slice(&data);
-        }
-
         debug!(
             frame_id,
             rects = update.rects.len(),
@@ -571,7 +850,43 @@ impl GfxHandler {
             "GFX uncompressed frame PDU created",
         );
 
-        wrap_zgfx(&raw_pdus)
+        Self::end_surface_frame(frame_id, raw_pdus)
+    }
+
+    /// Create a ZGFX-wrapped buffer for one RemoteFX Progressive update: WireToSurface2 with
+    /// RDPGFX_CODECID_CAPROGRESSIVE. First call also includes surface setup PDUs.
+    pub fn create_remotefx_pdu(state: &mut GfxState, update: &GfxRemoteFxUpdate) -> Vec<u8> {
+        let mut raw_pdus = Vec::new();
+        let frame_id = Self::begin_surface_frame(state, update.width, update.height, &mut raw_pdus);
+
+        // A new surface gets a new codec context; its first message carries SYNC and CONTEXT.
+        let (codec_context_id, header) = match state.progressive_context {
+            Some(id) => (id, false),
+            None => {
+                let id = state.next_codec_context;
+                state.next_codec_context = id.wrapping_add(1);
+                state.progressive_context = Some(id);
+                (id, true)
+            }
+        };
+        let bitmap_data = crate::encoder::rfx::progressive_message(&update.data, frame_id, header);
+        let rfx_bytes = bitmap_data.len();
+        if let Ok(data) = encode_vec(&ServerPdu::WireToSurface2(WireToSurface2Pdu {
+            surface_id: 0,
+            codec_id: Codec2Type::RemoteFxProgressive,
+            codec_context_id,
+            pixel_format: GfxPixelFormat::XRgb,
+            bitmap_data,
+        })) {
+            raw_pdus.extend_from_slice(&data);
+        }
+
+        debug!(
+            frame_id, codec_context_id, header, tiles = update.tiles, rfx_bytes,
+            "GFX RemoteFX Progressive frame PDU created"
+        );
+
+        Self::end_surface_frame(frame_id, raw_pdus)
     }
 }
 
@@ -592,8 +907,13 @@ impl DvcProcessor for GfxHandler {
         let raw_data = unwrap_zgfx(payload);
         let data = raw_data.as_deref().unwrap_or(payload);
 
-        let client_pdu: ClientPdu = match decode(data) {
+        let client_pdu: ClientPdu = match decode_client_pdu(data) {
             Ok(pdu) => pdu,
+            Err(e) if data.starts_with(&[0x12, 0x00]) => {
+                // Without a CapsConfirm the client waits forever on "Configuring remote PC".
+                warn!(payload = ?&data[..data.len().min(64)], "GFX: undecodable CapabilitiesAdvertise: {e}");
+                return Ok(Vec::new());
+            }
             Err(e) => {
                 // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16, CacheImportOffer 0x10)
                 // Log and ignore rather than crashing the connection
@@ -609,7 +929,7 @@ impl DvcProcessor for GfxHandler {
         match client_pdu {
             ClientPdu::CapabilitiesAdvertise(caps) => {
                 let cap_sets = &caps.0;
-                info!("GFX client capabilities: {} sets", cap_sets.len());
+                info!(sets = ?cap_sets, "GFX client capabilities: {} sets", cap_sets.len());
 
                 let mut state = self.state.lock().unwrap();
 
@@ -619,71 +939,16 @@ impl DvcProcessor for GfxHandler {
                     return Ok(Vec::new());
                 }
 
-                let mut best_cap = None;
-
-                for cap in cap_sets {
-                    match cap {
-                        CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            best_cap = Some(cap.clone());
-                            break;
-                        }
-                        CapabilitySet::V10_6 { flags } | CapabilitySet::V10_6Err { flags }
-                            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            best_cap = Some(cap.clone());
-                        }
-                        CapabilitySet::V10_5 { flags } | CapabilitySet::V10_4 { flags }
-                            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_3 { flags }
-                            if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
-                            if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_1 => {
-                            // V10_1 has no AVC_DISABLED flag — always supports AVC
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V8_1 { flags }
-                            if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            // V8.1 only supports AVC420, not AVC444
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        _ => {
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                    }
-                }
-
-                let confirmed = best_cap.unwrap_or(CapabilitySet::V8 {
-                    flags: ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags::empty(),
-                });
+                let negotiated = negotiate_caps(cap_sets);
+                state.avc420_supported = negotiated.avc420;
+                state.avc444_supported = negotiated.avc444;
+                let confirmed = negotiated.confirmed;
 
                 info!(
                     avc420 = state.avc420_supported,
                     avc444_client = state.avc444_supported,
                     avc444_enabled = state.avc444_enabled,
+                    ?confirmed,
                     "GFX capabilities negotiated"
                 );
 
@@ -692,6 +957,8 @@ impl DvcProcessor for GfxHandler {
                 // GFX channel is open, so no bitmap/GFX mixing will occur.
                 state.confirmed_cap = Some(confirmed.clone());
                 state.caps_confirmed = true;
+                state.request_idr();
+                state.caps_notify.notify_one();
 
                 let confirm_pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(confirmed));
                 let msg = make_dvc_message(&confirm_pdu)?;
@@ -701,7 +968,7 @@ impl DvcProcessor for GfxHandler {
 
             ClientPdu::FrameAcknowledge(ack) => {
                 let mut state = self.state.lock().unwrap();
-                state.ack_frame(ack.frame_id);
+                state.ack_frame(ack.frame_id, ack.queue_depth, Instant::now());
 
                 // Log stats every 60 acked frames (~1 second at 60fps)
                 if ack.frame_id % 60 == 0 {
@@ -756,3 +1023,352 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RDPGFX_CAPS_ADVERTISE_PDU with the given (version, caps data) sets.
+    fn caps_advertise(sets: &[(u32, &[u8])]) -> Vec<u8> {
+        let body: usize = sets.iter().map(|(_, d)| 8 + d.len()).sum();
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&0x0012u16.to_le_bytes());
+        pdu.extend_from_slice(&0u16.to_le_bytes());
+        pdu.extend_from_slice(&((8 + 2 + body) as u32).to_le_bytes());
+        pdu.extend_from_slice(&(sets.len() as u16).to_le_bytes());
+        for (version, data) in sets {
+            pdu.extend_from_slice(&version.to_le_bytes());
+            pdu.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            pdu.extend_from_slice(data);
+        }
+        pdu
+    }
+
+    #[test]
+    fn caps_advertise_with_unknown_version_still_decodes() {
+        // A client advertising a version ironrdp-pdu does not know (0xB0000) next to V10.7.
+        let data = caps_advertise(&[(0x000B_0000, &[0, 0, 0, 0]), (0x000A_0701, &[0, 0, 0, 0])]);
+        assert!(decode::<ClientPdu>(&data).is_err(), "precondition: plain decode rejects it");
+
+        let pdu = decode_client_pdu(&data).expect("unknown caps set must be skipped");
+        let ClientPdu::CapabilitiesAdvertise(caps) = pdu else { panic!("not a caps advertise") };
+        assert_eq!(caps.0.len(), 1);
+        assert!(matches!(caps.0[0], CapabilitySet::V10_7 { .. }));
+    }
+
+    #[test]
+    fn known_caps_advertise_decodes_unchanged() {
+        let data = caps_advertise(&[(0x000A_0701, &[0, 0, 0, 0]), (0x0008_0004, &[0, 0, 0, 0])]);
+        let ClientPdu::CapabilitiesAdvertise(caps) = decode_client_pdu(&data).unwrap() else {
+            panic!("not a caps advertise")
+        };
+        assert_eq!(caps.0.len(), 2);
+    }
+
+    fn sent(n: u32) -> GfxState {
+        let mut s = GfxState::new(64, 64, false);
+        for _ in 0..n {
+            s.next_frame_id();
+        }
+        s
+    }
+
+    #[test]
+    fn gate_allows_up_to_two_pending() {
+        let mut s = sent(2);
+        assert!(s.can_send(Instant::now()));
+        s.next_frame_id();
+        assert!(!s.can_send(Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn ack_reopens_gate() {
+        let mut s = sent(3);
+        assert!(!s.can_send(Instant::now()));
+        let notify = Arc::clone(&s.ack_notify);
+        let woken = notify.notified();
+        s.ack_frame(1, QueueDepth::Unavailable, Instant::now());
+        assert!(s.can_send(Instant::now()));
+        assert!(tokio::time::timeout(Duration::from_millis(100), woken).await.is_ok());
+    }
+
+    #[test]
+    fn suspend_disables_gate() {
+        let mut s = sent(3);
+        s.ack_frame(1, QueueDepth::Suspend, Instant::now());
+        for _ in 0..5 {
+            s.next_frame_id();
+        }
+        assert!(s.can_send(Instant::now()));
+        // Resuming must not inherit the frames sent while suspended (never acked).
+        s.ack_frame(2, QueueDepth::AvailableBytes(0), Instant::now());
+        assert!(s.can_send(Instant::now()));
+        for _ in 0..3 {
+            s.next_frame_id();
+        }
+        assert!(!s.can_send(Instant::now()));
+    }
+
+    #[test]
+    fn stall_recovers_with_idr() {
+        let mut s = sent(3);
+        let t = s.last_frame_time.expect("frame sent");
+        assert!(!s.can_send(t + Duration::from_millis(900)));
+        assert!(s.can_send(t + Duration::from_millis(1100)));
+        assert_eq!(s.pending_acks, 0);
+        assert!(s.take_idr_request());
+        assert!(!s.take_idr_request());
+    }
+
+    #[test]
+    fn no_false_stall_while_acks_flow() {
+        let mut s = sent(4);
+        let t = s.last_frame_time.expect("frame sent");
+        s.ack_frame(1, QueueDepth::Unavailable, t + Duration::from_millis(900));
+        assert!(!s.can_send(t + Duration::from_millis(1500)));
+        assert!(!s.take_idr_request());
+    }
+
+    /// One frame acked `rtt` after it was sent, at `fps`.
+    fn with_rtt(rtt: Duration, fps: u32) -> GfxState {
+        let mut s = sent(1);
+        s.frame_rate = fps;
+        s.ack_frame(1, QueueDepth::Unavailable, Instant::now() + rtt);
+        s
+    }
+
+    #[test]
+    fn wan_rtt_widens_gate_by_baseline_in_flight() {
+        // 100 ms at 60 fps: 6 frames are in flight on an idle path.
+        let mut s = with_rtt(Duration::from_millis(100), 60);
+        for _ in 0..8 {
+            s.next_frame_id();
+        }
+        assert!(s.can_send(Instant::now()));
+        assert_eq!(s.backlog(), 2);
+        s.next_frame_id();
+        assert!(!s.can_send(Instant::now()));
+        assert_eq!(s.backlog(), 3);
+    }
+
+    #[test]
+    fn lan_rtt_keeps_two_frame_gate() {
+        let mut s = with_rtt(Duration::from_millis(10), 60);
+        for _ in 0..3 {
+            s.next_frame_id();
+        }
+        assert!(!s.can_send(Instant::now()));
+        assert_eq!(s.backlog(), 3);
+    }
+
+    #[test]
+    fn rfx_quality_defaults_to_auto_at_medium() {
+        let mut s = GfxState::new(64, 64, false);
+        for auto in [None, Some("auto"), Some("best")] {
+            s.set_rfx_quality(Some("high"));
+            s.set_rfx_quality(auto);
+            assert!(s.rfx_auto, "{auto:?}");
+            assert_eq!(s.rfx_quality, RfxQuality::Medium, "{auto:?}");
+        }
+        s.set_rfx_quality(Some("low"));
+        assert!(!s.rfx_auto);
+        assert_eq!(s.rfx_quality, RfxQuality::Low);
+        assert_eq!(RfxQuality::Low.as_str(), "low");
+    }
+
+    #[test]
+    fn baseline_follows_minimum_rtt() {
+        let mut s = with_rtt(Duration::from_millis(100), 60);
+        s.next_frame_id();
+        s.ack_frame(2, QueueDepth::Unavailable, Instant::now() + Duration::from_millis(400));
+        assert_eq!(s.baseline_in_flight(), 6);
+    }
+
+    #[test]
+    fn frame_in_the_channel_counts_toward_the_gate() {
+        let mut s = sent(2);
+        assert!(s.can_send(Instant::now()));
+        // The pipeline hands frame 3 to the session, which has not counted it yet.
+        s.frame_handed_off();
+        assert!(!s.can_send(Instant::now()));
+        s.next_frame_id();
+        assert_eq!(s.backlog(), 3);
+    }
+
+    fn confirmed(avc420: bool) -> GfxState {
+        let mut s = GfxState::new(816, 1544, false);
+        s.channel_id = Some(7);
+        s.caps_confirmed = true;
+        s.avc420_supported = avc420;
+        s
+    }
+
+    #[test]
+    fn gfx_ready_without_avc() {
+        let s = confirmed(false);
+        assert!(s.is_ready(), "GFX confirmed without AVC is still a usable GFX channel");
+        assert!(!s.avc_ready());
+        let s = confirmed(true);
+        assert!(s.is_ready() && s.avc_ready());
+        let mut s = confirmed(true);
+        s.caps_confirmed = false;
+        assert!(!s.is_ready() && !s.avc_ready());
+    }
+
+    /// The iOS Windows App's known sets (its unknown 0xB01xx sets are skipped by the decoder).
+    fn ios_caps() -> Vec<CapabilitySet> {
+        use ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags;
+        vec![
+            CapabilitySet::V8 { flags: CapabilitiesV8Flags::SMALL_CACHE },
+            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::SMALL_CACHE },
+            CapabilitySet::V10 { flags: CapabilitiesV10Flags::AVC_DISABLED },
+            CapabilitySet::V10_2 { flags: CapabilitiesV10Flags::AVC_DISABLED },
+            CapabilitySet::V10_3 { flags: CapabilitiesV103Flags::AVC_DISABLED },
+            CapabilitySet::V10_4 { flags: CapabilitiesV104Flags::AVC_DISABLED },
+        ]
+    }
+
+    #[test]
+    fn no_avc_client_gets_highest_version_confirmed() {
+        let n = negotiate_caps(&ios_caps());
+        assert_eq!(n.confirmed, CapabilitySet::V10_4 { flags: CapabilitiesV104Flags::AVC_DISABLED });
+        assert!(!n.avc420 && !n.avc444);
+    }
+
+    #[test]
+    fn avc_client_negotiation_unchanged() {
+        let mut caps = ios_caps();
+        caps.push(CapabilitySet::V10_7 { flags: CapabilitiesV107Flags::empty() });
+        let n = negotiate_caps(&caps);
+        assert!(matches!(n.confirmed, CapabilitySet::V10_7 { .. }));
+        assert!(n.avc420 && n.avc444);
+        let n = negotiate_caps(&[CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::AVC420_ENABLED }]);
+        assert!(n.avc420 && !n.avc444);
+    }
+
+    #[test]
+    fn v10_4_caps_confirm_encodes() {
+        let pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(CapabilitySet::V10_4 {
+            flags: CapabilitiesV104Flags::AVC_DISABLED,
+        }));
+        let raw = encode_vec(&pdu).unwrap();
+        // header(type 0x0013, flags 0, length 20) + version 0xA0400 + dataLength 4 + flags
+        let mut want = vec![0x13, 0, 0, 0, 20, 0, 0, 0, 0x00, 0x04, 0x0A, 0x00, 4, 0, 0, 0];
+        want.extend_from_slice(&CapabilitiesV104Flags::AVC_DISABLED.bits().to_le_bytes());
+        assert_eq!(raw, want);
+    }
+
+    #[test]
+    fn zgfx_multipart_round_trips() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let wrapped = wrap_zgfx(&data);
+        assert_eq!(wrapped[0], 0xE1);
+        assert_eq!(u16::from_le_bytes([wrapped[1], wrapped[2]]), 4);
+        assert_eq!(u32::from_le_bytes([wrapped[3], wrapped[4], wrapped[5], wrapped[6]]), 200_000);
+        let first_seg = u32::from_le_bytes([wrapped[7], wrapped[8], wrapped[9], wrapped[10]]);
+        assert_eq!(first_seg, 65_535, "segmentSize counts the compression byte and fits u16 range");
+        assert_eq!(unwrap_zgfx(&wrapped).unwrap(), data);
+    }
+
+    fn decode_all(raw: &[u8]) -> Vec<ServerPdu> {
+        let mut cur = ironrdp_core::ReadCursor::new(raw);
+        let mut out = Vec::new();
+        while !cur.is_empty() {
+            out.push(<ServerPdu as ironrdp_core::Decode>::decode(&mut cur).expect("valid GFX PDU"));
+        }
+        out
+    }
+
+    #[test]
+    fn uncompressed_frame_sets_up_surface_at_frame_size() {
+        use crate::display::UncompressedRect;
+        // GfxState still holds a stale size; the surface must follow the frame (816x1544).
+        let mut s = confirmed(false);
+        s.width = 1920;
+        s.height = 1080;
+        let (w, h) = (816u16, 100u16);
+        let update = GfxUncompressedUpdate {
+            rects: vec![UncompressedRect {
+                x: 0, y: 0, width: w, height: h,
+                pixel_data: bytes::Bytes::from(vec![0xAB; w as usize * h as usize * 4]),
+            }],
+            width: 816,
+            height: 1544,
+        };
+        let wrapped = GfxHandler::create_uncompressed_pdu(&mut s, &update);
+        assert_eq!(wrapped[0], 0xE1, "326 KB frame needs multipart ZGFX");
+        let pdus = decode_all(&unwrap_zgfx(&wrapped).unwrap());
+        let ServerPdu::ResetGraphics(reset) = &pdus[0] else { panic!("ResetGraphics first: {pdus:?}") };
+        assert_eq!((reset.width, reset.height), (816, 1544));
+        let ServerPdu::CreateSurface(cs) = &pdus[1] else { panic!("CreateSurface second") };
+        assert_eq!((cs.width, cs.height), (816, 1544));
+        assert!(matches!(pdus[2], ServerPdu::MapSurfaceToOutput(_)));
+        let ServerPdu::StartFrame(start) = &pdus[3] else { panic!("StartFrame") };
+        let ServerPdu::WireToSurface1(w2s) = &pdus[4] else { panic!("WireToSurface1") };
+        assert_eq!(w2s.codec_id, Codec1Type::Uncompressed);
+        assert_eq!(w2s.bitmap_data.len(), w as usize * h as usize * 4);
+        assert_eq!((w2s.destination_rectangle.right, w2s.destination_rectangle.bottom), (816, 100));
+        let ServerPdu::EndFrame(end) = &pdus[5] else { panic!("EndFrame") };
+        assert_eq!(start.frame_id, end.frame_id);
+        assert_eq!(pdus.len(), 6);
+
+        // Next update: no surface setup, still framed.
+        let pdus = decode_all(&unwrap_zgfx(&GfxHandler::create_uncompressed_pdu(&mut s, &update)).unwrap());
+        assert!(matches!(pdus[0], ServerPdu::StartFrame(_)));
+        assert!(matches!(pdus.last(), Some(ServerPdu::EndFrame(_))));
+    }
+
+    #[test]
+    fn remotefx_frame_is_progressive_wire_to_surface2() {
+        use crate::encoder::rfx::progressive_message;
+        let mut s = confirmed(false);
+        let (w, h) = (816u16, 1544u16);
+        let px = vec![0x80u8; usize::from(w) * usize::from(h) * 4];
+        let rect = |x, y, width, height| ironrdp_pdu::codecs::rfx::RfxRectangle { x, y, width, height };
+        let update = encode_gfx_progressive(&px, usize::from(w) * 4, w, h, &[rect(100, 100, 10, 10)], RfxQuality::Medium).expect("encode");
+        let w2s = |pdus: &[ServerPdu], i: usize| match &pdus[i] {
+            ServerPdu::WireToSurface2(p) => p.clone(),
+            other => panic!("WireToSurface2 at {i}: {other:?}"),
+        };
+
+        let pdus = decode_all(&unwrap_zgfx(&GfxHandler::create_remotefx_pdu(&mut s, &update)).unwrap());
+        let ServerPdu::CreateSurface(cs) = &pdus[1] else { panic!("CreateSurface: {pdus:?}") };
+        assert_eq!((cs.width, cs.height, cs.pixel_format), (w, h, GfxPixelFormat::XRgb));
+        let ServerPdu::StartFrame(start) = &pdus[3] else { panic!("StartFrame") };
+        let first = w2s(&pdus, 4);
+        assert_eq!(first.surface_id, 0);
+        assert_eq!(first.codec_id, Codec2Type::RemoteFxProgressive);
+        assert_eq!(first.codec_id as u16, 0x0009, "RDPGFX_CODECID_CAPROGRESSIVE");
+        assert_eq!(first.pixel_format, GfxPixelFormat::XRgb);
+        // First message of the codec context carries SYNC and CONTEXT.
+        assert_eq!(first.bitmap_data, progressive_message(&update.data, start.frame_id, true));
+        assert!(matches!(pdus[5], ServerPdu::EndFrame(_)));
+        assert_eq!(pdus.len(), 6);
+
+        // Same surface: no setup, same codec context, no SYNC/CONTEXT.
+        let pdus = decode_all(&unwrap_zgfx(&GfxHandler::create_remotefx_pdu(&mut s, &update)).unwrap());
+        assert_eq!(pdus.len(), 3);
+        let ServerPdu::StartFrame(start) = &pdus[0] else { panic!("StartFrame") };
+        let next = w2s(&pdus, 1);
+        assert_eq!(next.codec_context_id, first.codec_context_id);
+        assert_eq!(next.bitmap_data, progressive_message(&update.data, start.frame_id, false));
+
+        // A rebuilt surface starts a new codec context.
+        s.surface_created = false;
+        let pdus = decode_all(&unwrap_zgfx(&GfxHandler::create_remotefx_pdu(&mut s, &update)).unwrap());
+        let ServerPdu::StartFrame(start) = &pdus[3] else { panic!("StartFrame") };
+        let rebuilt = w2s(&pdus, 4);
+        assert_ne!(rebuilt.codec_context_id, first.codec_context_id);
+        assert_eq!(rebuilt.bitmap_data, progressive_message(&update.data, start.frame_id, true));
+    }
+
+    #[test]
+    fn caps_confirm_requests_idr() {
+        let mut s = GfxState::new(64, 64, false);
+        assert!(!s.take_idr_request());
+        s.request_idr();
+        s.request_idr();
+        assert!(s.take_idr_request());
+        assert!(!s.take_idr_request());
+    }
+}

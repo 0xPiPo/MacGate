@@ -63,13 +63,12 @@ impl TlsIdentityCtx {
     }
 
     pub fn make_acceptor(&self) -> anyhow::Result<TlsAcceptor> {
-        let mut server_config = rustls::ServerConfig::builder()
+        // No SSLKEYLOGFILE support: session keys would let anyone with the log decrypt
+        // the delegated NLA password.
+        let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(self.certs.clone(), self.priv_key.clone_key())
             .context("bad certificate/key")?;
-
-        // This adds support for the SSLKEYLOGFILE env variable (https://wiki.wireshark.org/TLS#using-the-pre-master-secret)
-        server_config.key_log = Arc::new(rustls::KeyLogFile::new());
 
         Ok(TlsAcceptor::from(Arc::new(server_config)))
     }

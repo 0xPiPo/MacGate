@@ -7,6 +7,8 @@ pub use {tokio, tokio_rustls};
 
 mod macros;
 
+mod auth;
+
 mod builder;
 mod capabilities;
 mod clipboard;
@@ -16,14 +18,17 @@ pub mod gfx;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;
+mod lifecycle;
 mod server;
 mod sound;
 
+pub use auth::*;
 pub use clipboard::*;
 pub use display::*;
 pub use handler::*;
 #[cfg(feature = "helper")]
 pub use helper::*;
+pub use lifecycle::*;
 pub use server::*;
 pub use sound::*;
 
