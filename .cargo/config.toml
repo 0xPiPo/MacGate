@@ -1,5 +1,9 @@
-[env]
-# Swift concurrency runtime library required by screencapturekit crate.
-# Paths are searched in order: Xcode toolchain, then CommandLineTools.
-# This is needed for `cargo test` and `cargo bench` to find libswift_Concurrency.dylib.
-DYLD_LIBRARY_PATH = { value = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx:/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx", force = true }
+# screencapturekit links @rpath/libswift_Concurrency.dylib, which on macOS 12+ lives only in the
+# dyld shared cache under /usr/lib/swift. Give every binary (tests and benches included) that
+# rpath. A DYLD_LIBRARY_PATH to Xcode's swift-5.5 back-deploy copy loaded a second Swift runtime
+# and broke `xcodebuild -find clang` on CI (Xcode 26.6).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
