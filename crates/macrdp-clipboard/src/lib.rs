@@ -232,6 +232,11 @@ impl CliprdrBackend for MacClipboardBackend {
             tracing::warn!("Received error format data response from client");
             return;
         }
+        if response.data().len() as u64 > self.transfer_manager.max_file_size() {
+            tracing::warn!(bytes = response.data().len(), "Clipboard data from client exceeds max_file_size, dropping");
+            self.pending_paste_format = None;
+            return;
+        }
 
         let format = self.pending_paste_format.take();
         match format {
