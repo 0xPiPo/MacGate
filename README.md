@@ -1,125 +1,114 @@
-# macrdp
+<p align="center"><img src="docs/images/icon.png" width="128" alt="MacGate icon"></p>
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
-[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Supported-green.svg)](#)
+<h1 align="center">MacGate</h1>
 
-**[English](README_EN.md)** | 中文
-
-**macOS 远程桌面服务端**
-
-原生 macOS RDP 服务端。从 Windows、Linux、iOS 或 Android 远程连接你的 Mac — 支持任何标准 RDP 客户端，如 Windows 远程桌面 (mstsc)、Microsoft Remote Desktop、FreeRDP。
-
-> **为什么选 macrdp？** macOS 没有内置 RDP 服务端，自带的 VNC 又慢又模糊。macrdp 让你的 Mac 拥有一流的远程桌面体验 — 快速、清晰、开箱即用兼容所有 RDP 客户端。
+<p align="center"><b>A real RDP server for macOS.</b> Reach your Mac from your phone or PC with the free
+Microsoft Remote Desktop / Windows App. Log in with your Mac account; the session is sized to
+your device, and nobody at the desk can watch.</p>
 
 ---
 
-## 功能特性
+## Why
 
-- **标准 RDP 协议** — 兼容任何 RDP 客户端，客户端无需安装特殊软件
-- **硬件加速编码** — 通过 Apple VideoToolbox GPU 加速 H.264，Apple Silicon 上低延迟
-- **高保真色彩** — AVC444 模式像素级色彩还原（RDP 10）
-- **完整键鼠支持** — 104 键映射、数字键盘、修饰键、滚轮，完整输入注入
-- **HiDPI / Retina 支持** — 2x/3x 倍率采集，远程 4K 高清显示
-- **灵活配置** — 分辨率、帧率、码率、编码器、质量预设，简单 TOML 配置
-- **安全连接** — NLA/CredSSP 认证 + 自动生成 TLS 证书
-- **锁屏采集** — 锁屏时自动切换 CoreGraphics 回退
+On Windows, remote desktop just works. The session matches your phone's screen, it's fast, it
+logs in with your Windows account, and the physical console locks while you're away. On a Mac
+the built-in option is VNC: blurry, slow, a fixed resolution, and whatever you do is mirrored on
+the monitor for anyone in the room.
 
----
+MacGate brings the Windows experience to the Mac. It speaks standard RDP, so any RDP client
+works, including the free Microsoft Windows App on iPhone, iPad and Android, mstsc on Windows,
+and FreeRDP on Linux. Nothing needs to be installed on the client.
 
-## 环境要求
+## What it does
 
-- **macOS 14+**（Sonoma 或更高版本）
-- **Rust 1.75+**
-- 屏幕录制权限（系统设置 > 隐私与安全性）
-- 辅助功能权限（用于键盘鼠标注入）
+- **Logs in with your Mac account.** It uses NLA (CredSSP) with your macOS password. Only an NT
+  hash is stored, in the Keychain, and every login is re-checked against OpenDirectory.
+- **Sizes the session to your device.** A virtual display is created at the client's
+  resolution, so an iPhone gets a real portrait desktop, not a letterboxed 1440p one.
+- **Three display modes:**
+  - **Mirror:** the monitor shows what you see.
+  - **Extend:** your phone gets its own extra screen.
+  - **Curtain:** private. The monitor goes into standby over DDC/CI and local keyboard and mouse
+    are blocked, so your session is invisible at the desk. A one-click test checks whether your
+    monitor supports standby, and falls back to black-out windows when it doesn't.
+- **Picks a codec per client.** Clients with H.264 get VideoToolbox hardware encoding. Clients
+  without it (the iOS Windows App) get RemoteFX Progressive, encoded only for the 64×64 tiles
+  that changed, with **Auto** quality that follows network congestion.
+- **Low latency.** Frames are sent the moment they're encoded, with ack-based flow control, so
+  slow links never build a queue.
+- **Unlocks remotely.** Type your password on the lock screen from your phone, or turn on
+  optional auto-unlock.
+- **Close to zero idle cost.** A static screen means no encoding and no timers. With no one
+  connected it uses 0% CPU.
+- **Clipboard** (text, HTML, files), **audio**, drag, double-click, smooth scrolling and Unicode
+  input.
+- **Native SwiftUI menu-bar app** with onboarding, settings and live session stats.
 
----
+<p align="center">
+  <img src="docs/images/popover-connected.png" width="300" alt="Menu-bar popover during a session">
+  &nbsp;
+  <img src="docs/images/settings-display.png" width="420" alt="Display settings">
+</p>
 
-## 快速开始
+## How it works
+
+```
+iPhone / PC ──RDP over TLS (NLA)──▶ MacGate.app (SwiftUI)
+                                      └─ macrdp-server (Rust helper, JSON Lines over stdio)
+                                           ├─ IronRDP (patched): CredSSP, GFX pipeline
+                                           ├─ ScreenCaptureKit + CGVirtualDisplay
+                                           ├─ VideoToolbox H.264 / RemoteFX Progressive
+                                           └─ CGEvent input, DDC monitor power
+```
+
+The protocol work, the security model and the bugs found along the way are covered in
+**[ENGINEERING.md](ENGINEERING.md)**. Two examples: why an iPhone gets RemoteFX Progressive and
+not H.264, and why turning a monitor off through WindowServer left the HDMI dark until a reboot.
+
+## Install
+
+Requirements: an Apple Silicon Mac on macOS 26 or later, with Xcode 27 and a Rust toolchain.
 
 ```bash
-# 编译
-cargo build --release
-
-# 运行
-cargo run --release --bin macrdp-server
-
-# 从任意 RDP 客户端连接 → Mac-IP:3389
+make app            # builds build/macrdp.app (Rust helper + SwiftUI app)
+open build/macrdp.app
 ```
 
----
+On first launch, onboarding asks for **Screen Recording** and **Accessibility** and your **Mac
+password** (stored only as an NT hash in your Keychain). Then connect from any RDP client to
+`<your-mac-ip>:3389` with your Mac username and password. The menu shows the addresses and the
+TLS fingerprint to compare with the client's certificate prompt.
 
-## 配置
+Optional: create a self-signed code-signing identity named `macrdp-dev`, and `make app` will use
+it. Then macOS remembers permissions and Keychain access across rebuilds.
 
-复制 `config.example.toml` 为 `config.toml` 并按需修改：
+## Security
 
-```toml
-# 网络
-port = 13389
+- MacGate is designed for the **LAN or a VPN such as WireGuard**. Do not expose port 3389 to the
+  internet.
+- Only NLA is offered; TLS-only and standard RDP security are refused. Handshakes are
+  rate-limited, time-limited and capped per IP.
+- No secrets are written to logs or config. The config file is created with mode 0600.
+- MacGate uses private macOS APIs (virtual displays, DDC, screen lock). A macOS update can break
+  them, and they keep MacGate out of the Mac App Store.
 
-# 认证
-username = "admin"
-password = "123456"
+## Status
 
-# 显示
-width = 0          # 0 = 自动检测
-height = 0
-frame_rate = 60
-hidpi_scale = 2    # Retina 上 2 倍缩放获得 4K
+MacGate is used daily by its author with the iOS Windows App over the LAN and WireGuard. Other
+clients (mstsc, Android, macOS) and WAN or cellular use are less tested. See *What is still
+missing* in [ENGINEERING.md](ENGINEERING.md).
 
-# 编码
-quality = "high_quality"    # low_latency / balanced / high_quality
-encoder = "hardware"        # hardware (GPU) / software (CPU)
-chroma_mode = "avc420"      # avc420 (兼容) / avc444 (最佳画质)
-bitrate_mbps = 50           # 目标码率 (Mbps)
+## Credits
 
-# 日志
-log_level = "info"          # trace / debug / info / warn / error
-```
+- Based on **[x6nux/macrdp](https://github.com/x6nux/macrdp)**, whose original server, capture
+  and UI code this project builds on.
+- Uses **[IronRDP](https://github.com/Devolutions/IronRDP)** by Devolutions (MIT/Apache-2.0),
+  with patched acceptor and server crates.
+- Built by Pierre Abdelsayed with AI coding agents (Claude). I directed the architecture and
+  product decisions, tested every feature live on real devices, and diagnosed the issues
+  described in ENGINEERING.md.
 
-配置搜索顺序:
-1. `./config.toml`
-2. `~/.config/macrdp/config.toml`
-3. `~/Library/Application Support/macrdp/config.toml`
+## License
 
----
-
-## 项目结构
-
-```
-crates/
-├── macrdp-server/       主服务端程序
-├── macrdp-capture/      屏幕采集
-├── macrdp-input/        键鼠注入
-├── macrdp-encode/       视频编码
-├── ironrdp-server-gfx/  RDP 协议层 (IronRDP fork)
-└── ironrdp-acceptor-patched/
-                         RDP 连接接受器
-```
-
----
-
-## 致谢
-
-本项目的诞生离不开以下优秀的开源项目，在此致以诚挚的敬意：
-
-- **[IronRDP](https://github.com/Devolutions/IronRDP)** — 纯 Rust RDP 协议实现。macrdp 的协议栈基于 ironrdp-server 的 fork，添加了 GFX/AVC444 扩展。
-- **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — 开源 RDP 参考实现。其 AVC444 双流编码方案和 YUV444 B 区域拆分算法是 macrdp 实现的重要参考。
-- **[RustDesk](https://github.com/rustdesk/rustdesk)** — 使用 Rust 编写的开源远程桌面软件。其跨平台屏幕采集和输入注入的架构思路给予了很大启发。
-
----
-
-## 许可证
-
-本项目采用 **GNU 通用公共许可证 v3.0** 授权 — 详见 [LICENSE](LICENSE)。任何基于本项目的衍生作品必须同样以 GPLv3 开源。
-
----
-
-<details>
-<summary><b>关键词</b></summary>
-
-macOS RDP 服务端, Mac 远程桌面, Mac 远程桌面服务端, 远程桌面协议 macOS, 从 Windows 连接 Mac, 从 Linux 连接 Mac, 从安卓连接 Mac, 远程控制 Mac, Mac 远程访问, Mac 屏幕共享, Apple Silicon 远程桌面, VNC 替代方案, macOS 远程桌面方案, macOS RDP server, Mac remote desktop server, RDP server for Mac, connect to Mac from Windows, remote control Mac, VNC alternative Mac
-
-</details>
+[GPL-3.0-or-later](LICENSE). The patched IronRDP crates in `crates/ironrdp-*` keep their
+MIT/Apache-2.0 licenses.

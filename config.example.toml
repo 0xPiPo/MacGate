@@ -9,12 +9,19 @@
 # Options: any valid port number (1024-65535 recommended)
 port = 13389
 
+# Address to listen on. Default: "0.0.0.0" (all interfaces).
+# Set a LAN or WireGuard address to listen on that interface only.
+bind_address = "0.0.0.0"
+
+# Disconnect a session after this many seconds without client activity (0 = never)
+idle_timeout_secs = 1800
+
 # ─── Authentication ────────────────────────────────────────────────────────────
 
-# RDP login credentials (NLA/Hybrid/CredSSP)
-# Both fields are optional — if omitted, any credentials are accepted
-username = "admin"
-password = "123456"
+# You log in with the Mac account that runs macrdp, over NLA only.
+# Credentials never go in this file. Enroll once with `macrdp-server enroll`
+# (or in the app): the Mac password is checked and only its NT hash is kept
+# in the login Keychain.
 
 # ─── Display ───────────────────────────────────────────────────────────────────
 
@@ -28,10 +35,37 @@ width = 0
 # Set to a specific value (e.g. 1080) to force a fixed resolution
 height = 0
 
-# Target frame rate
+# What the Mac's own displays do during a session. Applies to the next connection.
+# Default: "curtain"
+# Options:
+#   "curtain" — privacy, like a Windows console lock, and the Mac's own keyboard, mouse and
+#               trackpad are ignored (needs the Accessibility permission). With
+#               curtain_standby_ok = true the session mirrors the Mac's screen and the external
+#               monitors go to DDC standby; ending the session wakes them. If macrdp crashes, the
+#               monitor's power button wakes it (and the next macrdp start does too). Otherwise
+#               the session display becomes main, the app covers the Mac's displays with black
+#               and every window on them moves into the session (put back when it ends).
+#   "mirror"  — the Mac's displays show the session, at the client's size.
+#   "extend"  — the session is an extra display beside the Mac's own, which keep their desktop.
+# display_mode = "curtain"
+
+# Curtain: the external monitors honour DDC standby. Set by the app's "Test monitor standby"
+# (Settings > Display). Absent means not tested; only true puts the monitors to sleep.
+# curtain_standby_ok = false
+
+# Curtain with standby: re-send standby every 5 s, so the monitor's power button cannot wake it
+# during a session. Default: false (no timer).
+# curtain_standby_keepalive = false
+
+# Most frames per second sent (also the RemoteFX path for clients without H.264).
+# Lower values use less CPU and bandwidth.
 # Default: 60
-# Options: 30, 60, 120
+# Options: 15, 30, 60, 120
 frame_rate = 60
+
+# Show the mouse cursor in the captured image.
+# Default: true
+# show_cursor = true
 
 # Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
 # Override this to force a specific bitrate. Adaptive quality will still adjust
@@ -70,6 +104,17 @@ encoder = "hardware"
 #   "avc444" — full YUV 4:4:4 via dual-stream AVC444 (requires V10+ client, best quality)
 # chroma_mode = "avc420"
 
+# RemoteFX image quality, used for clients without H.264 (e.g. the iOS Windows App).
+# Default: "auto"
+# Options:
+#   "auto"   — follows the connection: starts at medium, steps down one level (at most
+#              once a second) on congestion (ack backlog, dropped frames, rising RTT) and
+#              back up one level after 10 s without congestion
+#   "low"    — fewer bytes, softer text edges
+#   "medium" — the Microsoft RDP server default
+#   "high"   — sharper text, about 11% more bytes
+# rfx_quality = "auto"
+
 # ─── TLS ───────────────────────────────────────────────────────────────────────
 
 # Path to TLS certificate file (PEM format)
@@ -89,6 +134,30 @@ log_level = "info"
 
 # ─── Session ───────────────────────────────────────────────────────────────────
 
-# Idle timeout in seconds (disconnect after no input)
-# Default: 1800 (30 minutes)
-idle_timeout_secs = 1800
+# Lock the Mac when a session ends (a replacing connection does not lock). The next client
+# sees the lock screen and types the password there (or auto_unlock types it).
+# Default: false
+lock_on_disconnect = false
+
+# When a client connects to a locked Mac, type the password it signed in with into the lock
+# screen, then Return. The password (the one NLA just verified) stays in memory, zeroized
+# afterwards, for at most 10 s; it is typed once and never logged, sent to the app or saved.
+# Security: a client that can sign in can already type the password into the lock screen
+# itself, so this only saves retyping it; it grants no access a signed-in client lacks.
+# Needs a server restart. Default: false
+# auto_unlock = false
+
+# ─── Audio ─────────────────────────────────────────────────────────────────────
+
+[audio]
+# Forward Mac audio to the client. Capture runs only while a client has its audio
+# channel open, so an idle server does no audio work.
+# Default: true
+enabled = true
+
+# ─── Clipboard ─────────────────────────────────────────────────────────────────
+
+[clipboard]
+# Share the clipboard (text, images, files) with the client.
+# Default: true
+enabled = true
