@@ -18,7 +18,7 @@ pub use ironrdp_connector::DesktopSize;
 use ironrdp_pdu::nego;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
-pub use self::connection::{Acceptor, AcceptorResult, AcceptorState};
+pub use self::connection::{select_security_protocol, Acceptor, AcceptorResult, AcceptorState};
 pub use self::finalization::{FinalizationSequence, FinalizationState};
 use crate::credssp::resolve_generator;
 
@@ -51,17 +51,24 @@ where
     }
 }
 
-pub async fn accept_credssp<S, N>(
+/// Runs CredSSP, then hands the delegated credentials to `authorize`.
+///
+/// The connection proceeds only when `authorize` returns true. With HYBRID_EX the
+/// client learns the outcome (Early User Authorization Result) after `authorize`.
+pub async fn accept_credssp<S, N, A, F>(
     framed: &mut Framed<S>,
     acceptor: &mut Acceptor,
     network_client: &mut N,
     client_computer_name: ServerName,
     public_key: Vec<u8>,
     kerberos_config: Option<KerberosServerConfig>,
+    authorize: A,
 ) -> ConnectorResult<()>
 where
     S: FramedRead + FramedWrite,
     N: NetworkClient,
+    A: FnOnce(AuthIdentity) -> F,
+    F: core::future::Future<Output = bool>,
 {
     let mut buf = WriteBuf::new();
 
@@ -74,6 +81,7 @@ where
             client_computer_name,
             public_key,
             kerberos_config,
+            authorize,
         )
         .await
     } else {
@@ -99,7 +107,8 @@ where
 }
 
 #[instrument(level = "trace", skip_all, ret)]
-async fn perform_credssp_step<S, N>(
+#[expect(clippy::too_many_arguments)]
+async fn perform_credssp_step<S, N, A, F>(
     framed: &mut Framed<S>,
     acceptor: &mut Acceptor,
     network_client: &mut N,
@@ -107,10 +116,13 @@ async fn perform_credssp_step<S, N>(
     client_computer_name: ServerName,
     public_key: Vec<u8>,
     kerberos_config: Option<KerberosServerConfig>,
+    authorize: A,
 ) -> ConnectorResult<()>
 where
     S: FramedRead + FramedWrite,
     N: NetworkClient,
+    A: FnOnce(AuthIdentity) -> F,
+    F: core::future::Future<Output = bool>,
 {
     assert!(acceptor.should_perform_credssp());
     let AcceptorState::Credssp { protocol, .. } = acceptor.state else {
@@ -127,6 +139,22 @@ where
         kerberos_config,
     )
     .await;
+
+    // The hash-derived password is needed only here: reactivation starts after CredSSP.
+    if let Some(mut creds) = acceptor.creds.take() {
+        zeroize::Zeroize::zeroize(&mut creds.password);
+    }
+
+    let result = match result {
+        Ok(delegated) => {
+            if authorize(delegated).await {
+                Ok(())
+            } else {
+                Err(general_err!("delegated credentials rejected"))
+            }
+        }
+        Err(e) => Err(e),
+    };
 
     if protocol.intersects(nego::SecurityProtocol::HYBRID_EX) {
         trace!(?result, "HYBRID_EX");
@@ -162,7 +190,7 @@ where
         client_computer_name: ServerName,
         public_key: Vec<u8>,
         kerberos_config: Option<KerberosServerConfig>,
-    ) -> ConnectorResult<()>
+    ) -> ConnectorResult<AuthIdentity>
     where
         S: FramedRead + FramedWrite,
         N: NetworkClient,
@@ -220,6 +248,92 @@ where
             }
         }
 
-        Ok(())
+        sequence
+            .take_delegated()
+            .ok_or_else(|| general_err!("client sent no credentials"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::future::{ready, Future, Ready};
+    use core::task::{Context, Poll, Waker};
+    use std::io;
+
+    use ironrdp_async::bytes::BytesMut;
+    use ironrdp_connector::sspi::generator::NetworkRequest;
+    use ironrdp_pdu::rdp::client_info::Credentials;
+
+    use super::*;
+
+    /// A peer that closes the connection at once.
+    struct ClosedStream;
+
+    impl StreamWrapper for ClosedStream {
+        type InnerStream = ();
+        fn from_inner((): ()) -> Self {
+            Self
+        }
+        fn into_inner(self) {}
+        fn get_inner(&self) -> &() {
+            &()
+        }
+        fn get_inner_mut(&mut self) -> &mut () {
+            unreachable!()
+        }
+    }
+
+    impl FramedRead for ClosedStream {
+        type ReadFut<'read> = Ready<io::Result<usize>>;
+        fn read<'a>(&'a mut self, _buf: &'a mut BytesMut) -> Self::ReadFut<'a> {
+            ready(Ok(0))
+        }
+    }
+
+    impl FramedWrite for ClosedStream {
+        type WriteAllFut<'write> = Ready<io::Result<()>>;
+        fn write_all<'a>(&'a mut self, _buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            ready(Ok(()))
+        }
+    }
+
+    struct NoNetwork;
+
+    impl NetworkClient for NoNetwork {
+        #[expect(clippy::manual_async_fn, reason = "trait signature")]
+        fn send(&mut self, _request: &NetworkRequest) -> impl Future<Output = ConnectorResult<Vec<u8>>> {
+            async { Err(general_err!("no network in tests")) }
+        }
+    }
+
+    /// Polls a future that never waits on I/O.
+    fn run_ready<F: Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("future waited"),
+        }
+    }
+
+    #[test]
+    fn credssp_failure_clears_the_server_credentials() {
+        let creds = Credentials { username: "pipo".to_owned(), password: "secret".to_owned(), domain: None };
+        let mut acceptor = Acceptor::new(nego::SecurityProtocol::HYBRID, DesktopSize { width: 0, height: 0 }, Vec::new(), Some(creds));
+        acceptor.state = AcceptorState::Credssp {
+            requested_protocol: nego::SecurityProtocol::HYBRID,
+            protocol: nego::SecurityProtocol::HYBRID,
+        };
+        let mut framed = Framed::<ClosedStream>::new(());
+        let result = run_ready(accept_credssp(
+            &mut framed,
+            &mut acceptor,
+            &mut NoNetwork,
+            ServerName::new("phone"),
+            vec![0x42; 270],
+            None,
+            |_| async { true },
+        ));
+        assert!(result.is_err());
+        assert!(acceptor.creds.is_none());
     }
 }
