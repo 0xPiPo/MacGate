@@ -12,7 +12,6 @@ use ironrdp_svc::{StaticChannelSet, SvcServerProcessor};
 use pdu::rdp::capability_sets::CapabilitySet;
 use pdu::rdp::client_info::Credentials;
 use pdu::rdp::headers::ShareControlPdu;
-use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
 use pdu::{gcc, mcs, nego, rdp};
 use tracing::{debug, warn};
@@ -35,6 +34,10 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     reactivation: bool,
+    /// Client GCC core data desktopScaleFactor (percent), when sent.
+    desktop_scale_factor: Option<u32>,
+    /// Client GCC core data clientName (untrusted, client-chosen).
+    client_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -45,6 +48,10 @@ pub struct AcceptorResult {
     pub user_channel_id: u16,
     pub io_channel_id: u16,
     pub reactivation: bool,
+    /// Client GCC core data desktopScaleFactor (percent), when sent.
+    pub desktop_scale_factor: Option<u32>,
+    /// Client GCC core data clientName (untrusted, client-chosen).
+    pub client_name: Option<String>,
 }
 
 impl Acceptor {
@@ -65,6 +72,8 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             reactivation: false,
+            desktop_scale_factor: None,
+            client_name: None,
         }
     }
 
@@ -106,7 +115,18 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             reactivation: true,
+            desktop_scale_factor: consumed.desktop_scale_factor,
+            client_name: consumed.client_name.clone(),
         })
+    }
+
+    /// Sets the desktop size and server capabilities.
+    ///
+    /// The handshake (negotiation, TLS, CredSSP) runs before the session slot is free, so
+    /// these are only known once the authenticated connection becomes the active session.
+    pub fn set_desktop(&mut self, desktop_size: DesktopSize, capabilities: Vec<CapabilitySet>) {
+        self.desktop_size = desktop_size;
+        self.server_capabilities = capabilities;
     }
 
     pub fn attach_static_channel<T>(&mut self, channel: T)
@@ -159,6 +179,8 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 reactivation: self.reactivation,
+                desktop_scale_factor: self.desktop_scale_factor,
+                client_name: self.client_name.clone(),
             }),
             previous_state => {
                 self.state = previous_state;
@@ -174,6 +196,8 @@ pub enum AcceptorState {
     Consumed,
 
     InitiationWaitRequest,
+    /// A negotiation failure PDU was sent; the next step ends the connection.
+    NegotiationFailed,
     InitiationSendConfirm {
         requested_protocol: SecurityProtocol,
     },
@@ -242,6 +266,7 @@ impl State for AcceptorState {
         match self {
             Self::Consumed => "Consumed",
             Self::InitiationWaitRequest => "InitiationWaitRequest",
+            Self::NegotiationFailed => "NegotiationFailed",
             Self::InitiationSendConfirm { .. } => "InitiationSendConfirm",
             Self::SecurityUpgrade { .. } => "SecurityUpgrade",
             Self::Credssp { .. } => "Credssp",
@@ -273,6 +298,7 @@ impl Sequence for Acceptor {
         match &self.state {
             AcceptorState::Consumed => None,
             AcceptorState::InitiationWaitRequest => Some(&pdu::X224_HINT),
+            AcceptorState::NegotiationFailed => None,
             AcceptorState::InitiationSendConfirm { .. } => None,
             AcceptorState::SecurityUpgrade { .. } => None,
             AcceptorState::Credssp { .. } => None,
@@ -298,6 +324,10 @@ impl Sequence for Acceptor {
         let prev_state = mem::take(&mut self.state);
 
         let (written, next_state) = match prev_state {
+            AcceptorState::NegotiationFailed => {
+                return Err(ConnectorError::general("failed to negotiate security protocol"));
+            }
+
             AcceptorState::InitiationWaitRequest => {
                 let connection_request = decode::<X224<nego::ConnectionRequest>>(input)
                     .map_err(ConnectorError::decode)
@@ -314,17 +344,16 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::InitiationSendConfirm { requested_protocol } => {
-                let protocols = requested_protocol & self.security;
-                let protocol = if protocols.intersects(SecurityProtocol::HYBRID_EX) {
-                    SecurityProtocol::HYBRID_EX
-                } else if protocols.intersects(SecurityProtocol::HYBRID) {
-                    SecurityProtocol::HYBRID
-                } else if protocols.intersects(SecurityProtocol::SSL) {
-                    SecurityProtocol::SSL
-                } else if self.security.is_empty() {
-                    SecurityProtocol::empty()
-                } else {
-                    return Err(ConnectorError::general("failed to negotiate security protocol"));
+                let Some(protocol) = select_security_protocol(requested_protocol, self.security) else {
+                    // Tell the client why (e.g. "NLA required") instead of just closing.
+                    let failure = nego::ConnectionConfirm::Failure {
+                        code: negotiation_failure_code(self.security),
+                    };
+                    warn!(?requested_protocol, offered = ?self.security, "Refusing security protocol");
+                    let written =
+                        ironrdp_core::encode_buf(&X224(failure), output).map_err(ConnectorError::encode)?;
+                    self.state = AcceptorState::NegotiationFailed;
+                    return Written::from_size(written);
                 };
                 let connection_confirm = nego::ConnectionConfirm::Response {
                     flags: nego::ResponseFlags::empty(),
@@ -389,6 +418,8 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                self.desktop_scale_factor = gcc_blocks.core.optional_data.desktop_scale_factor;
+                self.client_name = Some(gcc_blocks.core.client_name.clone());
 
                 let joined: Vec<_> = gcc_blocks
                     .network
@@ -525,51 +556,16 @@ impl Sequence for Acceptor {
                 let client_info: rdp::ClientInfoPdu =
                     decode(data.user_data.as_ref()).map_err(ConnectorError::decode)?;
 
-                debug!(message = ?client_info, "Received");
+                // Only the names: ClientInfo also carries a password field and reconnect cookie.
+                debug!(
+                    user = ?client_info.client_info.credentials.username,
+                    domain = ?client_info.client_info.credentials.domain,
+                    "Received ClientInfo"
+                );
 
+                // Authentication happened in CredSSP; a session without it is never allowed.
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
-                    let creds = client_info.client_info.credentials;
-
-                    warn!(
-                        client_user = %creds.username,
-                        client_domain = ?creds.domain,
-                        server_user = ?self.creds.as_ref().map(|c| &c.username),
-                        protocol = ?protocol,
-                        "Credential check (non-hybrid)"
-                    );
-
-                    // Compare username and password only, ignore domain mismatch.
-                    // Accept empty client password — Windows mstsc sends empty creds on
-                    // first connect before prompting the user. Rejecting causes mstsc to
-                    // show an error instead of a login dialog.
-                    let creds_match = self.creds.as_ref().is_some_and(|server_creds| {
-                        creds.password.is_empty()
-                            || (server_creds.username == creds.username
-                                && server_creds.password == creds.password)
-                    });
-
-                    if !creds_match {
-                        warn!(
-                            client_user = %creds.username,
-                            client_domain = ?creds.domain,
-                            server_user = ?self.creds.as_ref().map(|c| &c.username),
-                            client_pass_len = creds.password.len(),
-                            server_pass_len = ?self.creds.as_ref().map(|c| c.password.len()),
-                            client_pass_bytes = ?creds.password.as_bytes(),
-                            server_pass_bytes = ?self.creds.as_ref().map(|c| c.password.as_bytes()),
-                            "Credential mismatch — rejecting"
-                        );
-                        let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-                            ProtocolIndependentCode::ServerDeniedConnection,
-                        ));
-
-                        debug!(message = ?info, "Send");
-
-                        util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
-
-                        return Err(ConnectorError::general("invalid credentials"));
-                    }
-                    debug!(user = %creds.username, domain = ?creds.domain, "Credentials accepted");
+                    return Err(ConnectorError::general("NLA (CredSSP) is required"));
                 }
 
                 (
@@ -783,5 +779,58 @@ fn create_gcc_blocks(
         },
         message_channel: None,
         multi_transport_channel: None,
+    }
+}
+
+/// Picks the strongest protocol both sides support, or `None` when there is no overlap.
+///
+/// An empty `offered` set means standard RDP security, which macrdp never offers.
+pub fn select_security_protocol(requested: SecurityProtocol, offered: SecurityProtocol) -> Option<SecurityProtocol> {
+    let common = requested & offered;
+    [SecurityProtocol::HYBRID_EX, SecurityProtocol::HYBRID, SecurityProtocol::SSL]
+        .into_iter()
+        .find(|p| common.intersects(*p))
+        .or_else(|| offered.is_empty().then(SecurityProtocol::empty))
+}
+
+fn negotiation_failure_code(offered: SecurityProtocol) -> nego::FailureCode {
+    if offered.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+        nego::FailureCode::HYBRID_REQUIRED_BY_SERVER
+    } else if offered.intersects(SecurityProtocol::SSL) {
+        nego::FailureCode::SSL_REQUIRED_BY_SERVER
+    } else {
+        nego::FailureCode::SSL_NOT_ALLOWED_BY_SERVER
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NLA: SecurityProtocol = SecurityProtocol::HYBRID.union(SecurityProtocol::HYBRID_EX);
+
+    #[test]
+    fn nla_offer_picks_hybrid_ex() {
+        let requested = SecurityProtocol::SSL | SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX;
+        assert_eq!(select_security_protocol(requested, NLA), Some(SecurityProtocol::HYBRID_EX));
+        assert_eq!(
+            select_security_protocol(SecurityProtocol::SSL | SecurityProtocol::HYBRID, NLA),
+            Some(SecurityProtocol::HYBRID)
+        );
+    }
+
+    #[test]
+    fn nla_offer_refuses_tls_only() {
+        assert_eq!(select_security_protocol(SecurityProtocol::SSL, NLA), None);
+    }
+
+    #[test]
+    fn nla_offer_refuses_standard_rdp_security() {
+        assert_eq!(select_security_protocol(SecurityProtocol::empty(), NLA), None);
+    }
+
+    #[test]
+    fn refusal_says_hybrid_required() {
+        assert_eq!(negotiation_failure_code(NLA), nego::FailureCode::HYBRID_REQUIRED_BY_SERVER);
     }
 }

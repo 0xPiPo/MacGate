@@ -40,7 +40,7 @@ repository = "https://github.com/Devolutions/IronRDP"
 [lib]
 name = "ironrdp_acceptor"
 path = "src/lib.rs"
-test = false
+test = true
 doctest = false
 
 [dependencies.ironrdp-async]
@@ -62,6 +62,9 @@ version = "0.6"
 [dependencies.tracing]
 version = "0.1"
 features = ["log"]
+
+[dependencies.zeroize]
+version = "1"
 
 [lints.clippy]
 alloc_instead_of_core = "warn"
