@@ -104,6 +104,26 @@ impl MouseInjector {
         Ok(())
     }
 
+    /// Releases every button the client still holds (the session ended mid-drag), at the
+    /// pointer's current position.
+    pub fn release_all(&self) {
+        let held = std::mem::take(&mut self.state().held);
+        if held == 0 {
+            return;
+        }
+        let at = CGEvent::new(match Self::source() {
+            Ok(source) => source,
+            Err(_) => return,
+        })
+        .map(|e| e.location())
+        .unwrap_or(CGPoint::new(0.0, 0.0));
+        for button in MouseButton::ALL.into_iter().filter(|b| held & b.bit() != 0) {
+            if let Err(e) = Self::post_mouse(button_event_type(button, false), button, at.x as i32, at.y as i32, None) {
+                tracing::warn!(?button, "Cannot release mouse button: {e}");
+            }
+        }
+    }
+
     /// Vertical wheel in RDP units (120 per notch, positive = away from the user)
     pub fn scroll(&self, vertical: i16) -> Result<()> {
         let px = self.state().vertical.add(vertical);

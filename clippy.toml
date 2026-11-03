@@ -1,0 +1,3 @@
+# Keep clippy suggestions within the workspace rust-version (Cargo.toml), which is the
+# newest minimum among the locked dependencies.
+msrv = "1.89"

@@ -16,7 +16,7 @@ ironrdp-acceptor = { path = "crates/ironrdp-acceptor-patched" }
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]

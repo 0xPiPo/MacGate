@@ -22,7 +22,7 @@ jobs:
       - name: Test (workspace + patched IronRDP crates)
         run: make test
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   swift:
     name: Swift package tests

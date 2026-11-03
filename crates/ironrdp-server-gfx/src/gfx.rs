@@ -155,15 +155,16 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
                     data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
                 ]) as usize;
                 offset += 4;
-                if offset < data.len() && data[offset] == 0x04 {
-                    // Uncompressed: skip compression_type byte
-                    offset += 1;
-                    let end = (offset + seg_size - 1).min(data.len());
-                    result.extend_from_slice(&data[offset..end]);
-                    offset = end;
-                } else {
+                // The size counts the compression-type byte; client-controlled, so 0 (no room
+                // for that byte) or a size past the end must not drive the slicing.
+                if seg_size == 0 || offset >= data.len() || data[offset] != 0x04 {
                     break;
                 }
+                // Uncompressed: skip compression_type byte
+                offset += 1;
+                let end = offset.saturating_add(seg_size - 1).min(data.len());
+                result.extend_from_slice(&data[offset..end]);
+                offset = end;
             }
             Some(result)
         }
@@ -264,7 +265,7 @@ pub fn negotiate_caps(cap_sets: &[CapabilitySet]) -> NegotiatedCaps {
 }
 
 fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
-    let data = encode_vec(pdu).map_err(|e| ironrdp_pdu::custom_err!("GfxEncode", e))?;
+    let data = encode_vec(pdu).map_err(|e| <ironrdp_pdu::PduError as ironrdp_pdu::PduErrorExt>::encode("GfxEncode", e))?;
     let wrapped = wrap_zgfx(&data);
     Ok(Box::new(RawGfxPdu(wrapped)))
 }
@@ -329,8 +330,6 @@ pub struct GfxState {
     bitrate_max: f64,
     bitrate_min: f64,
     last_frame_time: Option<Instant>,
-    /// Hot-updatable: target bitrate override (set via ConfigUpdate)
-    pub target_bitrate: Option<u32>,
     /// Hot-updatable: show cursor flag (set via ConfigUpdate), taken by the next session
     pub show_cursor: Option<bool>,
     /// Hot-updatable: frame rate (set via ConfigUpdate), taken by the next session
@@ -392,7 +391,6 @@ impl GfxState {
             bitrate_max: 0.0,
             bitrate_min: f64::MAX,
             last_frame_time: None,
-            target_bitrate: None,
             show_cursor: None,
             next_frame_rate: None,
             resolution: None,
@@ -1026,6 +1024,17 @@ impl DvcServerProcessor for GfxHandler {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn zgfx_multipart_with_hostile_sizes_never_panics() {
+        // Segment size 0: no room for the compression byte.
+        assert_eq!(unwrap_zgfx(&[0xE1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0]), Some(Vec::new()));
+        // Size past the end: truncated to what is there.
+        assert_eq!(unwrap_zgfx(&[0xE1, 1, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x04, 7, 8]), Some(vec![7, 8]));
+        // A well-formed segment of two bytes (compression byte + 1).
+        assert_eq!(unwrap_zgfx(&[0xE1, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0x04, 9]), Some(vec![9]));
+    }
+
     use super::*;
 
     /// RDPGFX_CAPS_ADVERTISE_PDU with the given (version, caps data) sets.

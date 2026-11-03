@@ -151,6 +151,15 @@ impl RdpServerInputHandler for MacInputHandler {
             tracing::warn!("Mouse injection failed: {e}");
         }
     }
+
+    fn release_all(&mut self) {
+        if let Some(kb) = &self.keyboard {
+            kb.release_all();
+        }
+        if let Some(m) = &self.mouse {
+            m.release_all();
+        }
+    }
 }
 
 #[cfg(test)]

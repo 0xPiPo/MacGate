@@ -18,62 +18,7 @@ use std::time::{Duration, Instant};
 use crate::bitrate_controller::{BitrateController, FrameStats};
 use crate::rfx_quality::{RfxQualityController, RfxSample};
 use crate::handler::MouseCoordMapper;
-use crate::perf_stats::SharedPerfStats;
 use crate::resolution::{self, Debounce, TargetLayout, LAYOUT_DEBOUNCE};
-
-/// Maximum tile size for bitmap updates
-const TILE_SIZE: u16 = 64;
-
-/// Convert a captured frame into tiled BitmapUpdate chunks
-pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
-    let bgra = match frame.data.as_bgra_bytes() {
-        Some(b) => b,
-        None => return Vec::new(), // PixelBuffer frames don't go through bitmap path
-    };
-    let mut updates = Vec::new();
-    let bpp: usize = 4;
-
-    let cols = (frame.width as u16 + tile_size - 1) / tile_size;
-    let rows = (frame.height as u16 + tile_size - 1) / tile_size;
-
-    for row in 0..rows {
-        for col in 0..cols {
-            let x = col * tile_size;
-            let y = row * tile_size;
-            let w = (frame.width as u16 - x).min(tile_size);
-            let h = (frame.height as u16 - y).min(tile_size);
-
-            let Some(width) = NonZeroU16::new(w) else { continue };
-            let Some(height) = NonZeroU16::new(h) else { continue };
-
-            let mut tile_data = Vec::with_capacity(w as usize * h as usize * bpp);
-            for dy in 0..h {
-                let src_y = (y + dy) as usize;
-                let src_x_start = x as usize * bpp;
-                let src_x_end = src_x_start + w as usize * bpp;
-                let row_start = src_y * frame.stride;
-                if row_start + src_x_end <= bgra.len() {
-                    tile_data.extend_from_slice(&bgra[row_start + src_x_start..row_start + src_x_end]);
-                }
-            }
-
-            let stride = w as usize * bpp;
-            let Some(stride) = NonZeroUsize::new(stride) else { continue };
-
-            updates.push(BitmapUpdate {
-                x,
-                y,
-                width,
-                height,
-                format: RdpPixelFormat::BgrA32,
-                data: Bytes::from(tile_data),
-                stride,
-            });
-        }
-    }
-
-    updates
-}
 
 /// How a captured frame reaches the client.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -245,8 +190,6 @@ pub struct MacDisplay {
     coord_mapper: MouseCoordMapper,
     /// Audio sender while a client has RDPSND open (None = audio disabled in config).
     audio_tap: Option<AudioTap>,
-    /// Shared performance statistics collector (None = disabled)
-    perf_stats: Option<SharedPerfStats>,
     /// Closes when the previous session's pipeline thread has exited.
     prev_pipeline: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Display mode for the next session (hot-updated from the settings).
@@ -257,6 +200,7 @@ pub struct MacDisplay {
 const PREV_PIPELINE_WAIT: Duration = Duration::from_secs(10);
 
 impl MacDisplay {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         width: u16, height: u16,
         fixed_resolution: bool,
@@ -268,7 +212,6 @@ impl MacDisplay {
         gfx_state: Arc<Mutex<GfxState>>,
         coord_mapper: MouseCoordMapper,
         audio_tap: Option<AudioTap>,
-        perf_stats: Option<SharedPerfStats>,
     ) -> Self {
         let base_bitrate = base_bitrate(bitrate_override, width as u32, height as u32, frame_rate as f32, quality);
         tracing::info!(base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0, "Base bitrate");
@@ -281,7 +224,6 @@ impl MacDisplay {
             frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
             coord_mapper,
             audio_tap,
-            perf_stats,
             prev_pipeline: None,
             display_mode: Arc::default(),
         }
@@ -413,7 +355,6 @@ impl RdpServerDisplay for MacDisplay {
             base_bitrate: self.base_bitrate,
             bitrate_override: self.bitrate_override,
             gfx_state: Arc::clone(&self.gfx_state),
-            perf_stats: self.perf_stats.clone(),
             bitrate_ctrl,
             coord_mapper: self.coord_mapper.clone(),
             display_mode: *self.display_mode.lock().unwrap(),
@@ -455,7 +396,6 @@ struct PipelineSetup {
     base_bitrate: u32,
     bitrate_override: Option<u32>,
     gfx_state: Arc<Mutex<GfxState>>,
-    perf_stats: Option<SharedPerfStats>,
     bitrate_ctrl: BitrateController,
     coord_mapper: MouseCoordMapper,
     display_mode: DisplayMode,
@@ -524,6 +464,9 @@ enum CachedFrame {
 
 /// IDR keepalive interval during idle scenes (seconds).
 const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
+/// An overdue keepalive that could not go out (ack gate closed, AVC not ready) is retried
+/// this often instead of waiting for the next screen change.
+const IDLE_IDR_RETRY: Duration = Duration::from_millis(250);
 
 /// Capture + encode loop, owned by the `macrdp-pipeline` thread.
 struct Pipeline {
@@ -547,8 +490,6 @@ struct Pipeline {
     coalesced: u32,
     /// Auto RemoteFX quality; None while the config fixes the level.
     rfx_ctrl: Option<RfxQualityController>,
-    /// Shared performance statistics collector (None = disabled)
-    perf_stats: Option<SharedPerfStats>,
     /// Session layout the capturer and encoder are built for.
     current: TargetLayout,
     /// Client layout changes; taken by run().
@@ -574,6 +515,9 @@ struct Pipeline {
     dirty_full: bool,
     /// Uncompressed path: newest frame while `dirty` still holds rects over the frame budget.
     carry_frame: Option<CapturedFrame>,
+    /// Capture waiting at the ack gate. Kept here, not on the stack, so a `run` select
+    /// branch that wins meanwhile (layout, audio, caps) does not drop the newest frame.
+    gate_held: Option<CapturedFrame>,
     /// RemoteFX encoding failed once: this session sends uncompressed rects instead.
     rfx_failed: bool,
     display_mode: DisplayMode,
@@ -711,7 +655,6 @@ impl Pipeline {
             last_applied_fps,
             coalesced: 0,
             rfx_ctrl: None,
-            perf_stats: s.perf_stats,
             current: s.layout,
             layout_rx: Some(s.layout_rx),
             audio_rx,
@@ -727,6 +670,7 @@ impl Pipeline {
             dirty: Vec::new(),
             dirty_full: true,
             carry_frame: None,
+            gate_held: None,
             rfx_failed: false,
             display_mode: s.display_mode,
             input_block,
@@ -861,6 +805,11 @@ impl Pipeline {
             return Err(e);
         }
         self.switch_audio_if_needed().await;
+        // A capture that was waiting at the gate when the last round was interrupted.
+        if let Some(frame) = self.gate_held.take() {
+            let frame = self.wait_for_gate(frame).await;
+            return self.encode_and_send(frame);
+        }
         // Rects left over from the frame budget go out before waiting for a new capture.
         if let Some(frame) = self.carry_frame.take() {
             let frame = self.latest(frame);
@@ -881,8 +830,9 @@ impl Pipeline {
                     if let Some(update) = self.send_idle_idr() {
                         return Ok(Some(update));
                     }
-                    // If send_idle_idr returned None (no encoder/gfx), just continue waiting
-                    None
+                    // Not sendable right now (gate closed, AVC not ready): retry soon rather
+                    // than block on capture, which may stay idle indefinitely.
+                    Some(IDLE_IDR_RETRY)
                 } else {
                     Some(IDLE_IDR_INTERVAL - elapsed)
                 }
@@ -1014,7 +964,9 @@ impl Pipeline {
 
     /// Hold `held` until the ack gate opens. Newer captures replace it before encoding,
     /// so dropped frames never break the H.264 reference chain.
-    async fn wait_for_gate(&mut self, mut held: CapturedFrame) -> CapturedFrame {
+    /// Cancel-safe: the held frame lives in `gate_held` until the gate opens.
+    async fn wait_for_gate(&mut self, held: CapturedFrame) -> CapturedFrame {
+        self.gate_held = Some(held);
         let notify = Arc::clone(&self.gfx_state.lock().unwrap().ack_notify);
         let mut capture_open = true;
         while !self.gate_open() {
@@ -1023,7 +975,7 @@ impl Pipeline {
                 ev = self.capturer.next_frame(), if capture_open => match ev {
                     Some(macrdp_capture::CaptureEvent::Frame(f)) => {
                         self.note_dirty(&f);
-                        held = f;
+                        self.gate_held = Some(f);
                         self.coalesced += 1;
                     }
                     Some(macrdp_capture::CaptureEvent::Idle) => {}
@@ -1033,7 +985,7 @@ impl Pipeline {
                 _ = tokio::time::sleep(ironrdp_server::gfx::ACK_STALL) => {}
             }
         }
-        held
+        self.gate_held.take().expect("set above; only this function takes it while waiting")
     }
 
     /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
@@ -1087,14 +1039,18 @@ impl Pipeline {
                     h264_aux: None,
                 }))
             }
+            // A failed keepalive waits a full interval before the next try, so a broken
+            // encoder is not re-run (and logged) every IDLE_IDR_RETRY.
             Ok(_) => {
                 tracing::warn!("Idle IDR encode returned empty data");
                 encoder.force_keyframe();
+                self.last_idr_time = Instant::now();
                 None
             }
             Err(e) => {
                 tracing::warn!("Idle IDR encode failed: {e}");
                 encoder.force_keyframe();
+                self.last_idr_time = Instant::now();
                 None
             }
         }
@@ -1104,14 +1060,6 @@ impl Pipeline {
     fn apply_adaptive_decision(&mut self) {
         if !self.bitrate_ctrl.should_evaluate() {
             return;
-        }
-
-        // RTT is for the stats display only; the controller reacts to congestion.
-        if let Some(ps) = &self.perf_stats {
-            let rtt = self.gfx_state.lock().unwrap().rtt_ewma_ms;
-            if rtt > 0.0 {
-                ps.lock().unwrap().record_rtt(rtt);
-            }
         }
 
         let decision = self.bitrate_ctrl.evaluate();
@@ -1293,6 +1241,8 @@ impl Pipeline {
         self.dirty.clear();
         self.dirty_full = true;
         self.carry_frame = None;
+        // Captured at the old layout.
+        self.gate_held = None;
     }
 
     /// Record a received capture's changed region (uncompressed path only).
@@ -1478,9 +1428,6 @@ impl Pipeline {
             frame_bytes: total_bytes,
             is_keyframe,
         });
-        if let Some(ps) = &self.perf_stats {
-            ps.lock().unwrap().record_frame(encode_ms, total_bytes, is_keyframe);
-        }
         self.apply_adaptive_decision();
 
         // Cache frame for idle IDR re-encoding (refcount clone, no copy)
@@ -1510,30 +1457,12 @@ impl Pipeline {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_frame_to_bitmap_updates() {
-        let frame = CapturedFrame {
-            width: 100,
-            height: 50,
-            data: FrameData::Raw(Bytes::from(vec![0u8; 100 * 50 * 4])),
-            stride: 400,
-            timestamp_us: 0,
-            dirty_rects: vec![],
-        };
-
-        let updates = frame_to_bitmap_updates(&frame, 64);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].x, 0);
-        assert_eq!(updates[0].width.get(), 64);
-        assert_eq!(updates[1].x, 64);
-        assert_eq!(updates[1].width.get(), 36);
-    }
 
     fn display() -> MacDisplay {
         MacDisplay::new(
             1920, 1080, false, 60, Quality::Balanced, macrdp_encode::EncoderPreference::Software,
             false, false, None, Arc::new(Mutex::new(GfxState::new(1920, 1080, false))),
-            MouseCoordMapper::new(1920, 1080, 1920, 1080), None, None,
+            MouseCoordMapper::new(1920, 1080, 1920, 1080), None,
         )
     }
 
@@ -1682,20 +1611,5 @@ mod tests {
         assert_eq!((update.width, update.height), (200, 130));
         // A buffer shorter than the frame is an error (falls back), never a panic.
         assert!(encode_remotefx(&frame(800 * 10), &[r(0, 0, 200, 130)], RfxQuality::Medium).expect("BGRA frame").is_err());
-    }
-
-    #[test]
-    fn test_frame_to_bitmap_updates_exact_tile() {
-        let frame = CapturedFrame {
-            width: 128,
-            height: 64,
-            data: FrameData::Raw(Bytes::from(vec![0u8; 128 * 64 * 4])),
-            stride: 512,
-            timestamp_us: 0,
-            dirty_rects: vec![],
-        };
-
-        let updates = frame_to_bitmap_updates(&frame, 64);
-        assert_eq!(updates.len(), 2);
     }
 }

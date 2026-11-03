@@ -27,7 +27,7 @@ pub fn resolve_resolution(
         (w, h)
     } else if let Ok(scale) = res_mode.parse::<u32>() {
         // Legacy hidpi_scale: 1, 2, 3, 4 → multiply logical resolution
-        let scale = scale.max(1).min(4);
+        let scale = scale.clamp(1, 4);
         let (w, h) = (logical_w as u32 * scale, logical_h as u32 * scale);
         tracing::info!(scale, w, h, logical_w, logical_h, "Resolution: legacy hidpi_scale → {}x{}", w, h);
         (w, h)
@@ -131,7 +131,9 @@ impl ServerHandle {
         if self.stopped.swap(true, Ordering::Relaxed) {
             return Ok(()); // Already stopped
         }
-        self.shutdown_notify.notify_waiters();
+        // notify_one stores a permit, so a stop issued before the server thread reaches its
+        // select! is not lost (notify_waiters would be, and join would then hang).
+        self.shutdown_notify.notify_one();
 
         // Extract thread handle from mutex *before* the await point so that
         // the MutexGuard is dropped and the future remains Send.
@@ -154,7 +156,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         if !self.stopped.load(Ordering::Relaxed) {
-            self.shutdown_notify.notify_waiters();
+            self.shutdown_notify.notify_one();
         }
     }
 }
@@ -264,7 +266,6 @@ pub async fn start_server(
 
     // Resolution
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
-    let res_auto = res_mode == "auto";
     let (width, height) = resolve_resolution(res_mode, width, height);
 
     // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
@@ -392,13 +393,19 @@ fn run_server_thread(args: ServerThreadArgs) {
         let audio_tap = args.config.audio.enabled.then(macrdp_audio::new_audio_tap);
 
         // Create audio factory
+        // Capture always delivers 48 kHz stereo; advertising anything else would play it at the
+        // wrong pitch or channel count, so the old config keys are only checked, not used.
+        let (sample_rate, channels) = (macrdp_capture::AUDIO_SAMPLE_RATE, macrdp_capture::AUDIO_CHANNELS);
+        if (args.config.audio.sample_rate, args.config.audio.channels) != (sample_rate, channels) {
+            tracing::warn!(
+                configured_rate = args.config.audio.sample_rate,
+                configured_channels = args.config.audio.channels,
+                "audio.sample_rate / audio.channels are ignored: audio is sent as {sample_rate} Hz, {channels} channels"
+            );
+        }
         let sound_factory: Option<Box<dyn ironrdp_server::SoundServerFactory>> =
             if let Some(ref tap) = audio_tap {
-                Some(Box::new(macrdp_audio::MacAudioFactory::new(
-                    Arc::clone(tap),
-                    args.config.audio.sample_rate,
-                    args.config.audio.channels,
-                )))
+                Some(Box::new(macrdp_audio::MacAudioFactory::new(Arc::clone(tap), sample_rate, channels)))
             } else {
                 None
             };
@@ -418,7 +425,8 @@ fn run_server_thread(args: ServerThreadArgs) {
         // Create display
         let res_fixed = args.config.resolution.as_deref().unwrap_or("auto") != "auto";
         let fixed_resolution = (args.config.width > 0 && args.config.height > 0) || res_fixed;
-        let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
+        // Clamped so a large configured value cannot overflow the u32 bits-per-second.
+        let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps.clamp(1, 1000) * 1_000_000);
         let show_cursor = args.config.show_cursor.unwrap_or(true);
         macrdp_capture::virtual_display::set_curtain_standby_ok(args.config.curtain_standby_ok == Some(true));
         macrdp_capture::virtual_display::set_curtain_standby_keepalive(args.config.curtain_standby_keepalive);
@@ -439,7 +447,6 @@ fn run_server_thread(args: ServerThreadArgs) {
             Arc::clone(&args.gfx_state),
             args.coord_mapper,
             audio_tap,
-            None, // perf_stats: not exposed via macrdp-core API yet
         )
         .with_display_mode(Arc::clone(&display_mode));
 
@@ -501,11 +508,6 @@ fn run_server_thread(args: ServerThreadArgs) {
                     ConfigUpdate::FrameRate(fps) => {
                         tracing::info!(fps, "Hot-update: frame_rate (next connection)");
                         gfx_for_config.lock().unwrap().next_frame_rate = Some(fps);
-                    }
-                    ConfigUpdate::BitrateKbps(kbps) => {
-                        let bps = kbps * 1000;
-                        tracing::info!(bitrate_kbps = kbps, "Hot-update: bitrate");
-                        gfx_for_config.lock().unwrap().target_bitrate = Some(bps);
                     }
                     ConfigUpdate::LogLevel(level) => {
                         tracing::info!(%level, "Hot-update: log_level");

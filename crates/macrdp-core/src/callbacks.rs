@@ -105,7 +105,6 @@ pub struct PermissionStatus {
 #[derive(Debug, Clone)]
 pub enum ConfigUpdate {
     FrameRate(u32),
-    BitrateKbps(u32),
     LogLevel(String),
     ShowCursor(bool),
     Resolution(String),

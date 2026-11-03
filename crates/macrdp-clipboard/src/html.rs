@@ -58,9 +58,67 @@ pub fn unwrap_html_format(data: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&data[start..end]).into_owned())
 }
 
+/// A plain-text rendering of an HTML fragment, for apps that only paste text: tags are
+/// dropped (block ends and `<br>` become line breaks; `<script>`/`<style>` content is
+/// skipped) and the common entities decoded.
+pub fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    let mut skip_until: Option<&str> = None;
+    while let Some(lt) = rest.find('<') {
+        if skip_until.is_none() {
+            out.push_str(&rest[..lt]);
+        }
+        let Some(gt) = rest[lt..].find('>') else {
+            rest = "";
+            break;
+        };
+        let tag = rest[lt + 1..lt + gt].trim().to_ascii_lowercase();
+        let name: String = tag.trim_start_matches('/').chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        match skip_until {
+            Some(end) => {
+                if tag.starts_with('/') && name == end {
+                    skip_until = None;
+                }
+            }
+            None if !tag.starts_with('/') && matches!(name.as_str(), "script" | "style") => {
+                skip_until = Some(if name == "script" { "script" } else { "style" });
+            }
+            None => {
+                let block_end = tag.starts_with('/')
+                    && matches!(name.as_str(), "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+                if name == "br" || block_end {
+                    out.push('\n');
+                }
+            }
+        }
+        rest = &rest[lt + gt + 1..];
+    }
+    if skip_until.is_none() {
+        out.push_str(rest);
+    }
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    decoded.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_to_text_keeps_the_words_and_line_breaks() {
+        let html = "<p>Hello <b>world</b> &amp; you</p><script>x()</script><div>2 &lt; 3<br>end</div>";
+        assert_eq!(html_to_text(html), "Hello world & you\n2 < 3\nend");
+        assert_eq!(html_to_text("plain"), "plain");
+        assert_eq!(html_to_text("broken <tag"), "broken");
+    }
+
 
     #[test]
     fn roundtrip_simple() {

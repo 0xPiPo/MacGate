@@ -124,8 +124,7 @@ impl PasteboardBridge {
             for i in 0..count {
                 let item = items.objectAtIndex(i);
                 if let Some(url_str) = item.stringForType(file_url_type) {
-                    let s = url_str.to_string();
-                    if let Some(path) = file_url_str_to_path(&s) {
+                    if let Some(path) = file_url_to_path(&url_str.to_string()) {
                         result.push(path);
                     }
                 }
@@ -135,8 +134,7 @@ impl PasteboardBridge {
         // Fallback: single string read (common case: one file copied).
         if result.is_empty() {
             if let Some(url_str) = pb.stringForType(file_url_type) {
-                let s = url_str.to_string();
-                if let Some(path) = file_url_str_to_path(&s) {
+                if let Some(path) = file_url_to_path(&url_str.to_string()) {
                     result.push(path);
                 }
             }
@@ -158,57 +156,59 @@ impl PasteboardBridge {
         }
     }
 
-    /// Write HTML content to the pasteboard.
+    /// Write HTML content to the pasteboard, with `text` as its plain-text version.
     ///
     /// Returns the new change count, or -1 on failure.
-    pub fn write_html(&self, html: &str) -> i64 {
+    pub fn write_html(&self, html: &str, text: &str) -> i64 {
         let pb = NSPasteboard::generalPasteboard();
         let change_count = pb.clearContents();
 
-        let ns_str = NSString::from_str(html);
         let html_type = NSString::from_str("public.html");
-
-        if !pb.setString_forType(&ns_str, &html_type) {
+        if !pb.setString_forType(&NSString::from_str(html), &html_type) {
             warn!("pasteboard: setString:forType: (HTML) returned false");
             return -1;
+        }
+        let text_type: &NSString = unsafe { NSPasteboardTypeString };
+        if !pb.setString_forType(&NSString::from_str(text), text_type) {
+            warn!("pasteboard: setString:forType: (text alongside HTML) returned false");
         }
 
         change_count as i64
     }
 
-    /// Write file URLs to the pasteboard.
+    /// Write file URLs to the pasteboard, one pasteboard item per file so Finder pastes
+    /// them all.
     ///
     /// Returns the new change count, or -1 on failure.
-    /// Currently writes only the first file URL (multi-file requires NSURL writeObjects).
     pub fn write_file_urls(&self, paths: &[PathBuf]) -> i64 {
-        use objc2_app_kit::NSPasteboardTypeFileURL;
+        use objc2::runtime::ProtocolObject;
+        use objc2_app_kit::{NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardWriting};
+        use objc2_foundation::NSArray;
 
         if paths.is_empty() {
             return -1;
         }
 
-        let pb = NSPasteboard::generalPasteboard();
-        let change_count = pb.clearContents();
-
         let file_url_type: &NSString = unsafe { NSPasteboardTypeFileURL };
-
-        let url = format!("file://{}", paths[0].display());
-        let ns_str = NSString::from_str(&url);
-        if !pb.setString_forType(&ns_str, file_url_type) {
-            warn!(
-                "pasteboard: failed to write file URL: {}",
-                paths[0].display()
-            );
+        let mut items: Vec<objc2::rc::Retained<ProtocolObject<dyn NSPasteboardWriting>>> = Vec::new();
+        for path in paths {
+            let item = NSPasteboardItem::new();
+            if item.setString_forType(&NSString::from_str(&path_to_file_url(path)), file_url_type) {
+                items.push(ProtocolObject::from_retained(item));
+            } else {
+                warn!("pasteboard: failed to add file URL: {}", path.display());
+            }
+        }
+        if items.is_empty() {
             return -1;
         }
 
-        if paths.len() > 1 {
-            warn!(
-                count = paths.len(),
-                "Multiple files received but only first written to pasteboard (multi-file paste not yet supported)"
-            );
+        let pb = NSPasteboard::generalPasteboard();
+        let change_count = pb.clearContents();
+        if !pb.writeObjects(&NSArray::from_retained_slice(&items)) {
+            warn!(count = items.len(), "pasteboard: failed to write file URLs");
+            return -1;
         }
-
         change_count as i64
     }
 
@@ -267,34 +267,60 @@ impl Default for PasteboardBridge {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a `file://` URL string into a `PathBuf`.
-fn file_url_str_to_path(url: &str) -> Option<PathBuf> {
-    if let Some(path) = url.strip_prefix("file://") {
-        // Percent-decode the path.
-        let decoded = percent_decode(path);
-        Some(PathBuf::from(decoded))
-    } else {
-        None
+/// A pasteboard file URL as a path. Finder copies file-reference URLs
+/// (`file:///.file/id=…`), which name no real path until NSURL resolves them.
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    use objc2_foundation::NSURL;
+    if url.starts_with("file:///.file/id=") {
+        let resolved = NSURL::URLWithString(&NSString::from_str(url))?.filePathURL()?;
+        return resolved.path().map(|p| PathBuf::from(p.to_string()));
     }
+    file_url_str_to_path(url)
 }
 
-/// Minimal percent-decoder for file paths (handles %XX escapes).
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// Convert a `file://` URL string into a `PathBuf`.
+fn file_url_str_to_path(url: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // `file:///path` or `file://localhost/path`.
+    let path = url.strip_prefix("file://")?;
+    let path = path.strip_prefix("localhost").unwrap_or(path);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(percent_decode(path))))
+}
+
+/// Decodes %XX escapes into raw bytes; the path's UTF-8 (e.g. `%E4%BD%A0`) is rebuilt from
+/// them, not read as one character per escape.
+fn percent_decode(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                out.push((h * 16 + l) as char);
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
+}
+
+/// `file://` URL for an absolute path, percent-encoding every byte outside RFC 3986's
+/// unreserved set and `/`, so spaces and non-ASCII names stay valid.
+fn path_to_file_url(path: &std::path::Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut url = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            url.push(b as char);
+        } else {
+            let _ = write!(url, "%{b:02X}");
+        }
+    }
+    url
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -315,4 +341,28 @@ fn tiff_to_png(tiff: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_urls_round_trip_spaces_and_non_ascii() {
+        for path in ["/Users/me/my file.txt", "/Users/me/你好.txt", "/tmp/100% #1?.txt"] {
+            let url = path_to_file_url(std::path::Path::new(path));
+            assert!(url.is_ascii() && !url.contains(' '), "{url}");
+            assert_eq!(file_url_str_to_path(&url), Some(PathBuf::from(path)));
+        }
+    }
+
+    #[test]
+    fn utf8_escapes_decode_to_one_character() {
+        assert_eq!(
+            file_url_str_to_path("file:///Users/me/%E4%BD%A0.txt"),
+            Some(PathBuf::from("/Users/me/你.txt"))
+        );
+        assert_eq!(file_url_str_to_path("file://localhost/tmp/a"), Some(PathBuf::from("/tmp/a")));
+        assert_eq!(file_url_str_to_path("https://example.com/a"), None);
+    }
 }

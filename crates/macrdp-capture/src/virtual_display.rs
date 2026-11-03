@@ -672,16 +672,13 @@ mod tests {
 
     #[test]
     fn mirror_never_targets_our_own_displays() {
-        let mut r = Registry::default();
-        r.live = vec![10, 11];
+        let r = Registry { live: vec![10, 11], ..Registry::default() };
         assert_eq!(r.mirror_targets(&[1, 10, 2, 11]), vec![1, 2]);
     }
 
     #[test]
     fn only_the_display_whose_configuration_is_in_effect_restores() {
-        let mut r = Registry::default();
-        r.live = vec![10, 11];
-        r.config_owner = Some(11);
+        let mut r = Registry { live: vec![10, 11], config_owner: Some(11), ..Registry::default() };
         assert!(r.release(10).is_none(), "an older display must not undo the newer one's configuration");
         assert!(r.release(11).is_some());
         assert!(r.live.is_empty());
@@ -690,10 +687,7 @@ mod tests {
 
     #[test]
     fn the_owner_hands_back_the_shield_list_on_release() {
-        let mut r = Registry::default();
-        r.live = vec![10];
-        r.config_owner = Some(10);
-        r.shield = vec![2, 3];
+        let mut r = Registry { live: vec![10], config_owner: Some(10), shield: vec![2, 3], ..Registry::default() };
         assert_eq!(r.release(10), Some(vec![2, 3]));
         assert!(r.shield.is_empty());
     }

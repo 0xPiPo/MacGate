@@ -6,7 +6,6 @@ pub mod yuv444_split;
 pub mod color_convert;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
-#[cfg(target_os = "macos")]
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -105,7 +104,8 @@ impl EncoderPreference {
 
 /// Create an H.264 encoder based on preference.
 /// When `mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
-pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, preference: EncoderPreference, mode_444: bool, bitrate: u32) -> Result<Box<dyn VideoEncoder>> {
+/// `_quality` is unused: the caller already folded it into `bitrate`.
+pub fn create_encoder(width: u32, height: u32, fps: f32, _quality: Quality, preference: EncoderPreference, mode_444: bool, bitrate: u32) -> Result<Box<dyn VideoEncoder>> {
     let enc_w = align16(width);
     let enc_h = align16(height);
 

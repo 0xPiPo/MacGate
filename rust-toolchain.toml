@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned so CI's clippy -D warnings only changes when this file does.
+channel = "1.97.0"
+components = ["clippy"]

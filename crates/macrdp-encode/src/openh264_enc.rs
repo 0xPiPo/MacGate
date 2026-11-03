@@ -8,7 +8,7 @@ use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::YUVBuffer;
 
 use crate::color_convert::VImageConverter;
-use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
+use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 pub struct OpenH264Encoder {
     encoder: Encoder,
@@ -55,20 +55,6 @@ impl Yuv444SplitBufs {
     }
 }
 
-/// Calculate optimal bitrate for screen content
-fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
-    let pixels = width as f64 * height as f64;
-    // Screen content needs high bitrate for sharp text and UI edges
-    // Base bits-per-pixel at 30fps, scaled by actual fps
-    let base_bpp = match quality {
-        Quality::LowLatency => 8.0,  // ~16 Mbps for 1080p@30
-        Quality::Balanced => 16.0,   // ~33 Mbps for 1080p@30
-        Quality::HighQuality => 24.0, // ~50 Mbps for 1080p@30
-    };
-    let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
-}
-
 fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Result<Encoder> {
     let config = EncoderConfig::new()
         .bitrate(openh264::encoder::BitRate::from_bps(bitrate))
@@ -82,6 +68,9 @@ fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Re
         .complexity(openh264::encoder::Complexity::Medium)
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps as u32 * 5))
         .long_term_reference(true)
+        // Every input path (vImage, the scalar padded path, AVC444) is BT.601 full range;
+        // say so, or decoders read it as limited range and crush blacks and whites.
+        .vui(openh264::encoder::VuiConfig::bt601().full_range(true))
         .num_threads(4);
 
     Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
@@ -137,6 +126,7 @@ impl OpenH264Encoder {
 }
 
 /// Convert BGRA to YUV420 into an encoder-sized buffer (handles padding).
+/// BT.601 full range, the same as the vImage path, so colours don't change with frame size.
 fn bgra_to_yuv420_padded(
     bgra: &[u8], src_w: u32, src_h: u32, stride: usize,
     enc_w: u32, enc_h: u32, yuv: &mut [u8],
@@ -159,12 +149,12 @@ fn bgra_to_yuv420_padded(
             let g = bgra[bgra_offset + 1] as i32;
             let r = bgra[bgra_offset + 2] as i32;
 
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            let y = (77 * r + 150 * g + 29 * b) >> 8;
             y_plane[row * ew + col] = y.clamp(0, 255) as u8;
 
             if row % 2 == 0 && col % 2 == 0 {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let u = ((-43 * r - 85 * g + 128 * b) >> 8) + 128;
+                let v = ((128 * r - 107 * g - 21 * b) >> 8) + 128;
                 let uv_idx = (row / 2) * uv_w + (col / 2);
                 u_plane[uv_idx] = u.clamp(0, 255) as u8;
                 v_plane[uv_idx] = v.clamp(0, 255) as u8;
@@ -252,11 +242,17 @@ impl VideoEncoder for OpenH264Encoder {
         let w = self.width;
         let h = self.height;
 
-        // Step 1: BGRA -> YUV444
+        // A refresh or recovery asked for an IDR: both streams must restart together.
+        if std::mem::take(&mut self.force_keyframe) {
+            self.encoder.force_intra_frame();
+            encoder_aux.force_intra_frame();
+        }
+
+        // Step 1: BGRA -> YUV444, rows laid out at the encoder width the split reads with
         crate::yuv444_split::bgra_to_yuv444(
-            data, width, height, stride,
+            data, width.min(w), height.min(h), stride, w as usize,
             &mut bufs.y444, &mut bufs.u444, &mut bufs.v444,
-        );
+        )?;
 
         // Step 2: YUV444 -> Main YUV420 + Aux YUV420 (B-area split)
         crate::yuv444_split::yuv444_split_to_yuv420(
@@ -322,7 +318,7 @@ impl VideoEncoder for OpenH264Encoder {
         unsafe {
             let raw = self.encoder.raw_api();
             let mut bitrate_info = openh264_sys2::SBitrateInfo {
-                iLayer: openh264_sys2::SPATIAL_LAYER_ALL as i32,
+                iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
                 iBitrate: bitrate_bps as i32,
             };
             let ret = raw.set_option(
@@ -340,7 +336,7 @@ impl VideoEncoder for OpenH264Encoder {
             unsafe {
                 let raw = aux.raw_api();
                 let mut bitrate_info = openh264_sys2::SBitrateInfo {
-                    iLayer: openh264_sys2::SPATIAL_LAYER_ALL as i32,
+                    iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
                     iBitrate: aux_bitrate as i32,
                 };
                 let _ = raw.set_option(
@@ -371,11 +367,5 @@ mod tests {
         let frame = encoder.encode_bgra(&bgra, 64, 64, 64 * 4).unwrap();
         assert!(!frame.data.is_empty());
         assert!(frame.is_keyframe);
-    }
-
-    #[test]
-    fn test_screen_bitrate() {
-        let br = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
-        assert!(br > 30_000_000, "1080p60 HighQuality should be > 30Mbps, got {}", br);
     }
 }

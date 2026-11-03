@@ -8,7 +8,9 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct AudioConfig {
     pub enabled: bool,
+    /// Kept for old config files; audio is always sent in the captured 48 kHz stereo format.
     pub sample_rate: u32,
+    /// Kept for old config files; see `sample_rate`.
     pub channels: u16,
 }
 
@@ -148,7 +150,19 @@ impl ServerConfig {
                 "config.toml still holds username/password; they are ignored. Remove them: login uses the enrolled Mac account"
             );
         }
-        Ok(toml::from_str(&content)?)
+        toml::from_str(&content).map_err(|e| redacted_parse_error(&content, &e))
+    }
+}
+
+/// A parse error without the quoted source line: toml's own Display echoes the offending
+/// line, which in an old config can be a plaintext `password = ...`.
+fn redacted_parse_error(content: &str, e: &toml::de::Error) -> anyhow::Error {
+    match e.span() {
+        Some(span) => {
+            let line = content[..span.start.min(content.len())].matches('\n').count() + 1;
+            anyhow::anyhow!("TOML error on line {line}: {}", e.message())
+        }
+        None => anyhow::anyhow!("TOML error: {}", e.message()),
     }
 }
 
@@ -158,40 +172,56 @@ fn has_legacy_credentials(content: &str) -> bool {
         .is_ok_and(|t| t.contains_key("password") || t.contains_key("username"))
 }
 
-/// Returns the macrdp config directory.
-/// Search order: ./ -> ~/.config/macrdp -> ~/Library/Application Support/macrdp
+/// The macrdp config directory, shared by the app's helper and the command line (and the
+/// TLS files under it): `~/Library/Application Support/macrdp`. An older
+/// `~/.config/macrdp/config.toml` is still used while Application Support has none. The
+/// current directory is never searched, so where macrdp is started from cannot change its
+/// config, certificate or listen address.
 pub fn config_dir() -> PathBuf {
-    let candidates = config_dir_candidates();
-    for dir in &candidates {
-        if dir.join("config.toml").exists() {
-            return dir.clone();
+    let native = dirs::config_dir().map(|d| d.join("macrdp"));
+    let legacy = dirs::home_dir().map(|h| h.join(".config").join("macrdp"));
+    let chosen = match (&native, &legacy) {
+        (Some(native), Some(legacy)) if !native.join("config.toml").exists() && legacy.join("config.toml").exists() => {
+            legacy.clone()
         }
-    }
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| PathBuf::from("."))
+        _ => native.clone().or(legacy.clone()).unwrap_or_else(|| PathBuf::from(".")),
+    };
+    warn_ignored_configs(&chosen, [legacy, std::env::current_dir().ok()]);
+    chosen
 }
 
-fn config_dir_candidates() -> Vec<PathBuf> {
-    let mut dirs_list = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs_list.push(cwd);
-    } else {
-        dirs_list.push(PathBuf::from("."));
-    }
-    if let Some(home) = dirs::home_dir() {
-        dirs_list.push(home.join(".config").join("macrdp"));
-    }
-    if let Some(native) = dirs::config_dir() {
-        dirs_list.push(native.join("macrdp"));
-    }
-    dirs_list
+/// Says so, once, when a config.toml that earlier versions read is now ignored.
+fn warn_ignored_configs(chosen: &std::path::Path, others: [Option<PathBuf>; 2]) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        for dir in others.into_iter().flatten().filter(|d| d != chosen) {
+            let ignored = dir.join("config.toml");
+            if ignored.exists() {
+                tracing::warn!(
+                    ignored = %ignored.display(),
+                    used = %chosen.join("config.toml").display(),
+                    "This config file is not read; move it, or pass --config to use it"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_error_does_not_echo_the_source_line() {
+        let dir = std::env::temp_dir().join(format!("macrdp-config-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "port = 3389\npassword = hunter2\n").unwrap();
+        let err = format!("{:#}", ServerConfig::load_from_file(Some(&path)).unwrap_err());
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_default_config() {

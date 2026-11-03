@@ -55,6 +55,7 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
         .write(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("Cannot write {}", path.display()))?;
     // An older key file may predate the 0600 rule.
@@ -126,10 +127,15 @@ pub fn ipv4_addresses() -> Vec<String> {
 }
 
 /// Ensure TLS cert and key files exist. Generate if missing or expiring.
+///
+/// Only the self-signed pair macrdp manages is regenerated. A configured `cert_path` or
+/// `key_path` belongs to the user (often CA-issued and renewed elsewhere), so it is never
+/// overwritten: a missing or unreadable one is an error, an expiring one only a warning.
 pub fn ensure_tls_files(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf)> {
+    let user_supplied = cert_path.is_some() || key_path.is_some();
     let tls_dir = config_dir().join("tls");
     let cert = cert_path
         .map(PathBuf::from)
@@ -137,12 +143,26 @@ pub fn ensure_tls_files(
     let key = key_path
         .map(PathBuf::from)
         .unwrap_or_else(|| tls_dir.join("key.pem"));
+    ensure_pair(cert, key, user_supplied)
+}
+
+fn ensure_pair(cert: PathBuf, key: PathBuf, user_supplied: bool) -> Result<(PathBuf, PathBuf)> {
 
     let renew = if !cert.exists() || !key.exists() {
+        if user_supplied {
+            anyhow::bail!("Configured TLS files not found: {} / {}", cert.display(), key.display());
+        }
         true
     } else {
         match read_cert(&cert) {
             Ok(parsed) if days_left(&parsed) > RENEW_BEFORE_DAYS => false,
+            Ok(_) if user_supplied => {
+                tracing::warn!(path = %cert.display(), "Configured TLS certificate expires within {RENEW_BEFORE_DAYS} days");
+                false
+            }
+            Err(e) if user_supplied => {
+                return Err(e.context(format!("Configured TLS certificate {} is unusable", cert.display())));
+            }
             Ok(_) => {
                 tracing::info!("TLS certificate expires within {RENEW_BEFORE_DAYS} days, regenerating");
                 true
@@ -276,9 +296,9 @@ mod tests {
     fn valid_cert_is_kept() {
         let dir = TempDir::new().unwrap();
         let (cert_path, key_path) = paths(&dir);
-        ensure_tls_files(Some(&cert_path), Some(&key_path)).unwrap();
+        ensure_pair(cert_path.clone(), key_path.clone(), false).unwrap();
         let first = cert_fingerprint(&cert_path).unwrap();
-        ensure_tls_files(Some(&cert_path), Some(&key_path)).unwrap();
+        ensure_pair(cert_path.clone(), key_path.clone(), false).unwrap();
         assert_eq!(cert_fingerprint(&cert_path).unwrap(), first);
     }
 
@@ -288,9 +308,23 @@ mod tests {
         let (cert_path, key_path) = paths(&dir);
         generate_with_validity(&cert_path, &key_path, 10).unwrap();
         let old = cert_fingerprint(&cert_path).unwrap();
-        ensure_tls_files(Some(&cert_path), Some(&key_path)).unwrap();
+        ensure_pair(cert_path.clone(), key_path.clone(), false).unwrap();
         assert_ne!(cert_fingerprint(&cert_path).unwrap(), old);
         assert!(days_left(&read_cert(&cert_path).unwrap()) > RENEW_BEFORE_DAYS);
+    }
+
+    #[test]
+    fn configured_cert_is_never_replaced() {
+        let dir = TempDir::new().unwrap();
+        let (cert_path, key_path) = paths(&dir);
+        generate_with_validity(&cert_path, &key_path, 10).unwrap();
+        let old = cert_fingerprint(&cert_path).unwrap();
+        ensure_tls_files(Some(&cert_path), Some(&key_path)).unwrap();
+        assert_eq!(cert_fingerprint(&cert_path).unwrap(), old);
+
+        let missing = dir.path().join("missing.pem");
+        assert!(ensure_tls_files(Some(&missing), Some(&key_path)).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]

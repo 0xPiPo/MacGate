@@ -50,43 +50,67 @@ pub fn png_to_dib(image_data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(dib)
 }
 
+/// Largest DIB edge accepted from a client; bounds the RGBA allocation.
+const MAX_DIB_DIMENSION: u32 = 16384;
+
+/// BI_BITFIELDS: three DWORD colour masks follow a 40-byte BITMAPINFOHEADER.
+const BI_BITFIELDS: u32 = 3;
+
 /// Convert Windows CF_DIB format to PNG bytes.
+///
+/// The header is client-supplied: dimensions are bounded and the pixel data must cover them,
+/// so a malformed header is rejected instead of driving a huge allocation or loop.
 pub fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
     if dib.len() < BITMAPINFOHEADER_SIZE {
         anyhow::bail!("DIB data too small for BITMAPINFOHEADER");
     }
 
-    let width = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]) as u32;
+    let header_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
+    let width_raw = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]);
     let height_raw = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
+    let bits_per_pixel = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
+
+    let width = u32::try_from(width_raw).unwrap_or(0);
     let bottom_up = height_raw > 0;
     let height = height_raw.unsigned_abs();
-    let bits_per_pixel = u16::from_le_bytes([dib[14], dib[15]]);
+    if width == 0 || height == 0 || width > MAX_DIB_DIMENSION || height > MAX_DIB_DIMENSION {
+        anyhow::bail!("DIB dimensions {width_raw}x{height_raw} out of range");
+    }
+    if !matches!(bits_per_pixel, 24 | 32) {
+        anyhow::bail!("Unsupported DIB bit depth {bits_per_pixel}");
+    }
+    if header_size < BITMAPINFOHEADER_SIZE {
+        anyhow::bail!("DIB header size {header_size} too small");
+    }
 
     let bytes_per_pixel = (bits_per_pixel / 8) as usize;
-    let row_stride = ((width as usize * bytes_per_pixel + 3) / 4) * 4;
+    let row_stride = (width as usize * bytes_per_pixel).div_ceil(4) * 4;
 
-    let pixel_offset = BITMAPINFOHEADER_SIZE;
-    let pixel_data = &dib[pixel_offset..];
+    let masks = if header_size == BITMAPINFOHEADER_SIZE && compression == BI_BITFIELDS { 12 } else { 0 };
+    let pixel_offset = header_size + masks;
+    let pixel_data = dib.get(pixel_offset..).unwrap_or_default();
+    if pixel_data.len() < row_stride * height as usize {
+        anyhow::bail!("DIB pixel data shorter than {width}x{height} at {bits_per_pixel} bpp");
+    }
 
     let mut img = RgbaImage::new(width, height);
 
-    for y in 0..height {
+    let rows = |y: u32| {
         let src_y = if bottom_up { height - 1 - y } else { y };
-        let row_start = src_y as usize * row_stride;
+        &pixel_data[src_y as usize * row_stride..][..width as usize * bytes_per_pixel]
+    };
+    // The 4th byte of a 32-bpp DIB is alpha only if anything uses it: Windows leaves the
+    // reserved byte of BI_RGB images at 0, which would otherwise paste fully transparent.
+    let has_alpha = bits_per_pixel == 32
+        && (0..height).any(|y| rows(y).chunks_exact(4).any(|px| px[3] != 0));
 
-        for x in 0..width {
-            let px_start = row_start + x as usize * bytes_per_pixel;
-            if px_start + bytes_per_pixel > pixel_data.len() {
-                continue;
-            }
-            let (r, g, b, a) = match bits_per_pixel {
-                32 => (pixel_data[px_start + 2], pixel_data[px_start + 1],
-                       pixel_data[px_start], pixel_data[px_start + 3]),
-                24 => (pixel_data[px_start + 2], pixel_data[px_start + 1],
-                       pixel_data[px_start], 255),
-                _ => (0, 0, 0, 255),
-            };
-            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+    for y in 0..height {
+        let row = rows(y);
+
+        for (x, px) in row.chunks_exact(bytes_per_pixel).enumerate() {
+            let a = if has_alpha { px[3] } else { 255 };
+            img.put_pixel(x as u32, y, image::Rgba([px[2], px[1], px[0], a]));
         }
     }
 
@@ -222,6 +246,34 @@ mod tests {
     fn dib_too_small() {
         let result = dib_to_png(&[0u8; 10]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dib_with_zero_reserved_bytes_is_opaque() {
+        let mut dib = vec![0u8; BITMAPINFOHEADER_SIZE];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&[0x10, 0x20, 0x30, 0x00]); // B, G, R, reserved = 0
+        let png = dib_to_png(&dib).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(0, 0), &image::Rgba([0x30, 0x20, 0x10, 0xFF]));
+    }
+
+    #[test]
+    fn dib_hostile_header_rejected() {
+        let mut dib = vec![0u8; BITMAPINFOHEADER_SIZE];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        // Negative width.
+        dib[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        dib[8..12].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(dib_to_png(&dib).is_err());
+        // Plausible dimensions but no pixel data.
+        dib[4..8].copy_from_slice(&4000i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&4000i32.to_le_bytes());
+        assert!(dib_to_png(&dib).is_err());
     }
 
     #[test]

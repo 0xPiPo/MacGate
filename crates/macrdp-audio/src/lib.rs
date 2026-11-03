@@ -30,7 +30,18 @@ async fn audio_loop(
         channels
     );
 
+    let mut warned_format = false;
     while let Some(frame) = audio_rx.recv().await {
+        if frame.sample_rate != sample_rate || frame.channels != channels {
+            // Sending it as the negotiated format would play at the wrong pitch or layout.
+            if !std::mem::replace(&mut warned_format, true) {
+                tracing::warn!(
+                    frame.sample_rate, frame.channels, sample_rate, channels,
+                    "Dropping audio in a format other than the negotiated one"
+                );
+            }
+            continue;
+        }
         if base_timestamp_ms.is_none() {
             base_timestamp_ms = Some(frame.timestamp_ms);
         }
@@ -177,6 +188,7 @@ impl SoundServerFactory for MacAudioFactory {
         let sample_rate = self.sample_rate;
         // 20ms frame: sample_rate/50 samples per channel * channels
         let frame_size_interleaved = (sample_rate as usize / 50) * channels as usize;
+        assert!(frame_size_interleaved > 0, "audio format {sample_rate} Hz x {channels} has no 20 ms frame");
 
         // A fresh channel per connection; the handler publishes it once the client opens RDPSND.
         let (tx, rx) = mpsc::channel::<AudioFrame>(32);

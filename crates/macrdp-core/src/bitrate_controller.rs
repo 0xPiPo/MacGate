@@ -53,7 +53,9 @@ impl BitrateController {
 
     pub fn record_frame(&mut self, stats: FrameStats) { self.eval_window.push(stats); }
     pub fn current_bitrate(&self) -> u32 { self.current_bitrate }
-    pub fn current_fps(&self) -> u32 { (self.target_fps as f32 * FPS_TIERS[self.current_fps_tier]) as u32 }
+    /// Never 0: a low configured rate scaled by the lowest tier would otherwise round down to
+    /// an invalid capture interval.
+    pub fn current_fps(&self) -> u32 { ((self.target_fps as f32 * FPS_TIERS[self.current_fps_tier]) as u32).max(1) }
     pub fn target_fps(&self) -> u32 { self.target_fps }
 
     pub fn on_idle_recovery(&mut self) {

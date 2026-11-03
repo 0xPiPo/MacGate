@@ -11,6 +11,8 @@ struct MacRDPApp: App {
         signal(SIGPIPE, SIG_IGN)
         let startOnLaunch = UserDefaults.standard.object(forKey: "startOnLaunch") as? Bool ?? true
         let client = HelperClient(transport: Self.makeTransport(), wantsRunning: startOnLaunch)
+        // Onboarding starts the server itself when the user presses Done.
+        client.autoStartHeld = !UserDefaults.standard.bool(forKey: "onboardingDone")
         client.launch()
         _client = State(initialValue: client)
         let shield = CurtainShield()

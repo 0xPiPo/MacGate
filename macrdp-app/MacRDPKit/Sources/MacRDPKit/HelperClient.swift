@@ -47,6 +47,12 @@ public final class HelperClient {
     @ObservationIgnored private var pending: [Int: CheckedContinuation<Reply, Error>] = [:]
     @ObservationIgnored private var nextID = 0
     @ObservationIgnored private var failures = 0
+    /// A `start` from `startIfReady` is awaiting its reply.
+    @ObservationIgnored private var startInFlight = false
+    /// Set while onboarding is unfinished: the server is not started on its own.
+    @ObservationIgnored public var autoStartHeld = false
+    /// When the current helper was launched: only a helper that stayed up resets the backoff.
+    @ObservationIgnored private var spawnedAt = ContinuousClock.now
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var shuttingDown = false
     @ObservationIgnored private var launched = false
@@ -107,6 +113,7 @@ public final class HelperClient {
 
     private func spawn() {
         generation += 1
+        spawnedAt = .now
         let gen = generation
         link = failures == 0 ? .launching : .restarting
         do {
@@ -115,7 +122,12 @@ public final class HelperClient {
                 onExit: { [weak self] in self?.helperExited(generation: gen) })
             link = .ready
             Task {
-                guard (try? await self.request("get_state")) != nil else { return }
+                // A slow first answer (a Keychain prompt) times out; ask again rather than
+                // never auto-starting. A newer helper generation takes over on its own.
+                for _ in 0..<3 {
+                    if (try? await self.request("get_state")) != nil { break }
+                    guard gen == self.generation, self.link == .ready else { return }
+                }
                 self.startIfReady()
             }
         } catch {
@@ -126,6 +138,11 @@ public final class HelperClient {
 
     private func helperExited(generation gen: Int) {
         guard gen == generation, !shuttingDown else { return }
+        // Lines the dead helper left in the pipe may still arrive; they must not undo the reset.
+        generation += 1
+        // A helper that crashes right after its first status (e.g. on auto-start) must still back
+        // off, so the count resets only after a run long enough to count as healthy.
+        if ContinuousClock.now - spawnedAt > .seconds(30) { failures = 0 }
         failPending(.helperExited)
         status = ServerStatus()
         session = SessionInfo()
@@ -137,7 +154,7 @@ public final class HelperClient {
 
     private func scheduleRelaunch() {
         failures += 1
-        // 0.5 s, 1 s, 2 s … capped. Reset once the new helper reports a status.
+        // 0.5 s, 1 s, 2 s … capped. Reset once a helper has stayed up (see helperExited).
         let delay = min(.milliseconds(500) * (1 << min(failures - 1, 10)), maxBackoff)
         Task {
             try? await Task.sleep(for: delay)
@@ -165,7 +182,6 @@ public final class HelperClient {
                 continuation.resume(throwing: HelperError.rejected(reply.error ?? "The request failed."))
             }
         case .status(let new):
-            failures = 0
             status = new
             if new.running == false { restartRequired = false }
         case .session(let new):
@@ -178,7 +194,12 @@ public final class HelperClient {
             metrics.append(MetricPoint(id: metricSeq, fps: m.fps ?? 0, latencyMs: m.latencyMs ?? 0))
             if metrics.count > 60 { metrics.removeFirst(metrics.count - 60) }
         case .auth(let new): auth = new
-        case .permissions(let new): permissions = new
+        case .permissions(let new):
+            permissions = new
+            // Setup can finish outside onboarding (re-enrolling in Settings, a permission
+            // granted later): start then, not only after a helper launch. A helper sends
+            // status and auth before permissions, so those are this helper's too, never stale.
+            startIfReady()
         case .config(let new): config = new
         case .log(let entry): lastLog = entry
         }
@@ -198,8 +219,11 @@ public final class HelperClient {
         message["cmd"] = .string(cmd)
         var line = try JSONEncoder().encode(message)
         line.append(0x0A)
+        message = [:]
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
+            // The encoded line can carry a password: wiped once written to the pipe.
+            defer { line.resetBytes(in: 0..<line.count) }
             do {
                 try transport.send(line)
             } catch {
@@ -227,6 +251,8 @@ public final class HelperClient {
 
     public func start() async throws {
         wantsRunning = true
+        // An explicit start means setup is done, even if onboarding was closed early.
+        autoStartHeld = false
         try await request("start")
     }
 
@@ -242,12 +268,17 @@ public final class HelperClient {
     }
 
     /// Starts the server if it should run and the Mac is set up: enrolled, with both
-    /// permissions. Starting earlier would make the helper's macOS prompts appear before
-    /// onboarding explains them. Called after every helper launch and when onboarding ends.
+    /// permissions, and onboarding finished (`autoStartHeld` false). Starting earlier would
+    /// make the helper's macOS prompts appear before onboarding explains them. Called after
+    /// every helper launch, whenever permissions are reported, and when onboarding ends.
     public func startIfReady() {
-        guard wantsRunning, link == .ready, status.phase == .stopped,
+        guard wantsRunning, !autoStartHeld, !startInFlight, link == .ready, status.phase == .stopped,
               auth?.isReady == true, permissions?.allGranted == true else { return }
-        Task { try? await self.request("start") }
+        startInFlight = true
+        Task {
+            try? await self.request("start")
+            self.startInFlight = false
+        }
     }
 
     /// Re-reads the permissions from a fresh helper: macOS answers a process's Screen
@@ -258,9 +289,21 @@ public final class HelperClient {
             Task { try? await self.refresh() }
             return
         }
-        transport.shutdown()
+        // A request in flight (the last recheck's get_state, a permission prompt) would be
+        // failed by the restart; the caller polls, so try again on its next tick.
+        guard pending.isEmpty else { return }
+        // A recheck already waiting for its old helper to exit (or a relaunch) owns the next
+        // spawn; a second one would start two helpers.
+        guard link == .ready else { return }
+        // A new generation now, so the old helper's exit is not taken for a crash; the new
+        // helper starts once the old one is gone and has released the RDP port.
+        generation += 1
+        link = .restarting
         failPending(.helperExited)
-        spawn() // a new generation: the old helper's exit is ignored
+        transport.retire { [weak self] in
+            guard let self, !self.shuttingDown else { return }
+            self.spawn()
+        }
     }
 
     public func disconnect() async throws { try await request("disconnect") }
@@ -287,7 +330,9 @@ public final class HelperClient {
         }
     }
 
-    /// The password goes to the helper and nowhere else: it is never logged or kept here.
+    /// The password goes to the helper and nowhere else: it is never logged or stored. The
+    /// encoded request is wiped once written; Swift strings themselves cannot be wiped, so a
+    /// copy lives in memory until this call returns.
     public func enroll(password: String) async throws {
         try await request("enroll", ["password": .string(password)], timeout: .seconds(30))
         try? await refresh()

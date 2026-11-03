@@ -93,6 +93,7 @@ struct OnboardingView: View {
             Button(step == .connect ? "Done" : "Continue") {
                 if step == .connect {
                     onboardingDone = true
+                    client.autoStartHeld = false
                     client.startIfReady()
                     dismissWindow(id: "onboarding")
                 } else {

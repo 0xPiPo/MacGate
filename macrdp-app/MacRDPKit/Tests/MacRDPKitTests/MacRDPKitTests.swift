@@ -155,6 +155,11 @@ struct HelperClientTests {
         let client = HelperClient(transport: transport)
         client.launch()
         #expect(await eventually { transport.sent.count == 1 })
+        // While the first get_state is unanswered a recheck would only fail it: skipped.
+        client.recheckPermissions()
+        #expect(transport.shutdowns == 0)
+        transport.answerState(transport.sent[0]["id"], granted: false)
+        #expect(await eventually { client.permissions != nil })
         client.recheckPermissions()
         #expect(transport.shutdowns == 1)
         #expect(transport.launches == 2)

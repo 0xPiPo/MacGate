@@ -17,14 +17,14 @@ use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().preflight()
+    ScreenCaptureAccess.preflight()
 }
 
 /// Request Screen Recording permission (triggers system dialog if not granted)
 /// Returns true if already granted. Note: even after granting, the app
 /// may need to be restarted for the permission to take effect.
 pub fn request_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().request()
+    ScreenCaptureAccess.request()
 }
 
 /// ScreenCaptureKit without Screen Recording access shows the system prompt: callers that must
@@ -104,6 +104,11 @@ pub struct CapturedFrame {
     /// Empty means info unavailable — treat as full frame change.
     pub dirty_rects: Vec<Rect>,
 }
+
+/// The audio format ScreenCaptureKit is asked for (see `with_sample_rate` /
+/// `with_channel_count` below); RDPSND must advertise exactly this.
+pub const AUDIO_SAMPLE_RATE: u32 = 48000;
+pub const AUDIO_CHANNELS: u16 = 2;
 
 /// Raw audio frame from ScreenCaptureKit audio callback.
 /// Data is interleaved Float32 PCM (L0,R0, L1,R1, ...).
@@ -250,7 +255,8 @@ impl SCStreamOutputTrait for AudioOutputHandler {
             if channel_bufs.is_empty() {
                 return;
             }
-            let n = channel_bufs[0].len();
+            // The shortest buffer bounds the frame, so a ragged list cannot index out of range.
+            let n = channel_bufs.iter().map(|b| b.len()).min().unwrap_or(0);
             let mut out = Vec::with_capacity(n * channel_bufs.len());
             for i in 0..n {
                 for ch in &channel_bufs {
@@ -415,7 +421,7 @@ pub fn detect_display_scale() -> Result<u32> {
     let display = content.displays().into_iter().next()
         .context("No display found")?;
     let logical_w = display.width();
-    let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
+    let scale = physical_w.checked_div(logical_w).unwrap_or(1);
     Ok(scale.max(1))
 }
 
@@ -429,7 +435,7 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
         .into_iter()
         .next()
         .context("No display found")?;
-    Ok((display.width() as u32, display.height() as u32))
+    Ok((display.width(), display.height()))
 }
 
 /// Query the main display's logical bounds from CoreGraphics.
@@ -610,6 +616,35 @@ impl Drop for ScreenCapturer {
     }
 }
 
+/// `image` drawn aspect-fit and centred on black into a `width`x`height` BGRA buffer.
+/// Returns the pixels and their bytes per row.
+fn scale_letterboxed(image: &core_graphics::image::CGImage, width: u32, height: u32) -> Option<(Vec<u8>, usize)> {
+    use core_graphics::base::{kCGBitmapByteOrder32Little, kCGImageAlphaPremultipliedFirst};
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::{CGContext, CGInterpolationQuality};
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+
+    let (iw, ih) = (image.width() as f64, image.height() as f64);
+    if width == 0 || height == 0 || iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    let (tw, th) = (width as usize, height as usize);
+    let mut ctx = CGContext::create_bitmap_context(
+        None, tw, th, 8, tw * 4, &CGColorSpace::create_device_rgb(),
+        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
+    );
+    let full = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(tw as f64, th as f64));
+    ctx.set_rgb_fill_color(0.0, 0.0, 0.0, 1.0);
+    ctx.fill_rect(full);
+    let scale = (tw as f64 / iw).min(th as f64 / ih);
+    let (dw, dh) = (iw * scale, ih * scale);
+    let origin = CGPoint::new((tw as f64 - dw) / 2.0, (th as f64 - dh) / 2.0);
+    ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityMedium);
+    ctx.draw_image(CGRect::new(&origin, &CGSize::new(dw, dh)), image);
+    let stride = ctx.bytes_per_row();
+    Some((ctx.data().to_vec(), stride))
+}
+
 /// Fallback capturer using CGDisplayCreateImage (CoreGraphics).
 /// Works during lock screen because it captures at the display level,
 /// below the window server / ScreenCaptureKit layer.
@@ -633,22 +668,31 @@ impl CgFallbackCapturer {
         }
     }
 
-    /// Capture a single frame using CGDisplayCreateImage
+    /// Capture a single frame using CGDisplayCreateImage, at the session size.
     pub fn capture_frame(&self) -> Option<CapturedFrame> {
         let display = core_graphics::display::CGDisplay::new(self.display_id);
         let image = display.image()?;
 
         let w = image.width() as u32;
         let h = image.height() as u32;
-        let bpr = image.bytes_per_row();
-        let data = image.data();
-        let raw = data.bytes().to_vec();
+        let (target_w, target_h) = (
+            if self.width > 0 { self.width } else { w },
+            if self.height > 0 { self.height } else { h },
+        );
+        let (raw, stride) = if (target_w, target_h) == (w, h) {
+            (image.data().bytes().to_vec(), image.bytes_per_row())
+        } else {
+            // The display's native size differs from the session's: scale, letterboxed like
+            // ScreenCaptureKit's preserves_aspect_ratio, so the frame matches the encoder and
+            // the mouse mapping.
+            scale_letterboxed(&image, target_w, target_h)?
+        };
 
         Some(CapturedFrame {
-            width: if self.width > 0 { self.width } else { w },
-            height: if self.height > 0 { self.height } else { h },
+            width: target_w,
+            height: target_h,
             data: FrameData::Raw(Bytes::from(raw)),
-            stride: bpr,
+            stride,
             timestamp_us: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

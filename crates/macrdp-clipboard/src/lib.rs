@@ -6,7 +6,7 @@ pub mod transfer;
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -35,8 +35,13 @@ pub struct MacClipboardBackend {
     temp_dir: PathBuf,
     poll_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
-    locked: bool,
+    /// The format requested from the client, as our canonical ID (`FORMAT_ID_HTML`,
+    /// `FORMAT_ID_FILE_LIST`, 8 or 13), whatever ID the client registered it under.
     pending_paste_format: Option<u32>,
+    /// Bumped by the poll thread on every Mac-side copy.
+    local_copies: Arc<AtomicU64>,
+    /// `local_copies` when the incoming file paste started: a Mac copy since then wins.
+    incoming_since: u64,
 }
 
 impl fmt::Debug for MacClipboardBackend {
@@ -50,8 +55,25 @@ impl fmt::Debug for MacClipboardBackend {
 impl_as_any!(MacClipboardBackend);
 
 impl MacClipboardBackend {
+    /// Once every incoming file is complete, writes them to the pasteboard.
+    fn finish_incoming_if_done(&mut self) {
+        if !self.transfer_manager.all_incoming_complete() {
+            return;
+        }
+        let paths = self.transfer_manager.flush_incoming_files();
+        if self.local_copies.load(Ordering::SeqCst) != self.incoming_since {
+            tracing::info!("Something newer was copied on the Mac; not pasting the finished files");
+            return;
+        }
+        if !paths.is_empty() {
+            let pb = PasteboardBridge::new();
+            let new_count = pb.write_file_urls(&paths);
+            self.last_change_count.store(new_count, Ordering::SeqCst);
+            tracing::info!(count = paths.len(), "Wrote incoming files to pasteboard");
+        }
+    }
+
     pub fn new(event_sender: mpsc::UnboundedSender<ServerEvent>, temp_dir: PathBuf, max_file_size: u64) -> Self {
-        std::fs::create_dir_all(&temp_dir).ok();
         Self {
             event_sender,
             last_change_count: Arc::new(AtomicI64::new(0)),
@@ -60,14 +82,14 @@ impl MacClipboardBackend {
             temp_dir,
             poll_handle: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
-            locked: false,
             pending_paste_format: None,
+            local_copies: Arc::new(AtomicU64::new(0)),
+            incoming_since: 0,
         }
     }
 
     /// Build a format list from the current pasteboard contents.
-    fn build_format_list() -> Vec<ClipboardFormat> {
-        let pb = PasteboardBridge::new();
+    fn build_format_list(pb: &PasteboardBridge) -> Vec<ClipboardFormat> {
         pb.available_types()
             .iter()
             .filter_map(|uti| {
@@ -105,6 +127,7 @@ impl CliprdrBackend for MacClipboardBackend {
         let last = self.last_change_count.clone();
         let sender = self.event_sender.clone();
         let stop = self.stop_signal.clone();
+        let local_copies = self.local_copies.clone();
 
         self.poll_handle = Some(std::thread::spawn(move || {
             let bridge = PasteboardBridge::new();
@@ -117,21 +140,9 @@ impl CliprdrBackend for MacClipboardBackend {
                 let current = bridge.change_count();
                 let prev = last.swap(current, Ordering::SeqCst);
                 if current != prev {
+                    local_copies.fetch_add(1, Ordering::SeqCst);
                     // Clipboard changed -- build format list and notify server
-                    let formats: Vec<ClipboardFormat> = bridge
-                        .available_types()
-                        .iter()
-                        .filter_map(|uti| {
-                            let fmt_id = uti_to_rdp_format_id(uti)?;
-                            let mut fmt = ClipboardFormat::new(ClipboardFormatId::new(fmt_id));
-                            match fmt_id {
-                                FORMAT_ID_HTML => { fmt = fmt.with_name(ClipboardFormatName::HTML); }
-                                FORMAT_ID_FILE_LIST => { fmt = fmt.with_name(ClipboardFormatName::FILE_LIST); }
-                                _ => {}
-                            }
-                            Some(fmt)
-                        })
-                        .collect();
+                    let formats = Self::build_format_list(&bridge);
                     if !formats.is_empty() {
                         let _ = sender.send(ServerEvent::Clipboard(
                             ClipboardMessage::SendInitiateCopy(formats),
@@ -146,7 +157,7 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_process_negotiated_capabilities(&mut self, _caps: ClipboardGeneralCapabilityFlags) {}
 
     fn on_request_format_list(&mut self) {
-        let formats = Self::build_format_list();
+        let formats = Self::build_format_list(&PasteboardBridge::new());
         let _ = self.event_sender.send(ServerEvent::Clipboard(
             ClipboardMessage::SendInitiateCopy(formats),
         ));
@@ -155,13 +166,31 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         self.remote_formats = available_formats.to_vec();
 
-        // Request the highest-fidelity format available, in order of preference
+        // A newer copy on the client supersedes a file paste still downloading.
+        self.transfer_manager.cancel_incoming();
+
+        // Request the highest-fidelity format available, in order of preference. Registered
+        // formats (HTML, file list) are found by name: each client picks its own ID for them.
+        let find = |canonical: u32| -> Option<ClipboardFormatId> {
+            let name = match canonical {
+                FORMAT_ID_HTML => Some(ClipboardFormatName::HTML),
+                FORMAT_ID_FILE_LIST => Some(ClipboardFormatName::FILE_LIST),
+                _ => None,
+            };
+            available_formats
+                .iter()
+                .find(|f| match &name {
+                    Some(name) => f.name().is_some_and(|n| n.value() == name.value()),
+                    None => f.id().value() == canonical,
+                })
+                .map(|f| f.id())
+        };
         let preferred = [FORMAT_ID_FILE_LIST, FORMAT_ID_HTML, 8, 13];
-        for &fmt_id in &preferred {
-            if available_formats.iter().any(|f| f.id().value() == fmt_id) {
-                self.pending_paste_format = Some(fmt_id);
+        for &canonical in &preferred {
+            if let Some(client_id) = find(canonical) {
+                self.pending_paste_format = Some(canonical);
                 let _ = self.event_sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(fmt_id)),
+                    ClipboardMessage::SendInitiatePaste(client_id),
                 ));
                 return;
             }
@@ -260,12 +289,15 @@ impl CliprdrBackend for MacClipboardBackend {
             Some(id) if id == FORMAT_ID_HTML => {
                 if let Some(html_content) = crate::html::unwrap_html_format(response.data()) {
                     let pb = PasteboardBridge::new();
-                    let new_count = pb.write_html(&html_content);
+                    // With a plain-text version too, so text-only apps can paste it.
+                    let text = crate::html::html_to_text(&html_content);
+                    let new_count = pb.write_html(&html_content, &text);
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
             Some(id) if id == FORMAT_ID_FILE_LIST => {
                 if let Ok(file_list) = response.to_file_list() {
+                    self.incoming_since = self.local_copies.load(Ordering::SeqCst);
                     self.transfer_manager.set_incoming_descriptors(file_list.files);
                     let requests = self.transfer_manager.generate_contents_requests();
                     for req in requests {
@@ -273,6 +305,8 @@ impl CliprdrBackend for MacClipboardBackend {
                             ServerEvent::ClipboardFileContentsRequest(req),
                         );
                     }
+                    // Only empty files (or nothing pasteable): no reply will come to finish it.
+                    self.finish_incoming_if_done();
                 }
             }
             _ => {
@@ -305,28 +339,18 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
-        self.transfer_manager.handle_contents_response(&response);
-
-        if self.transfer_manager.all_incoming_complete() {
-            let paths = self.transfer_manager.flush_incoming_files();
-            if !paths.is_empty() {
-                let pb = PasteboardBridge::new();
-                let new_count = pb.write_file_urls(&paths);
-                self.last_change_count.store(new_count, Ordering::SeqCst);
-                tracing::info!(count = paths.len(), "Wrote incoming files to pasteboard");
-            }
+        if let Some(next) = self.transfer_manager.handle_contents_response(&response) {
+            let _ = self.event_sender.send(ServerEvent::ClipboardFileContentsRequest(next));
+            return;
         }
+        self.finish_incoming_if_done();
     }
 
-    fn on_lock(&mut self, _data_id: LockDataId) {
-        self.locked = true;
-        self.transfer_manager.lock();
-    }
+    // Lock/Unlock concern the client keeping *our* clipboard data available; the files it
+    // may still fetch are read from disk on request, so there is nothing to hold or free.
+    fn on_lock(&mut self, _data_id: LockDataId) {}
 
-    fn on_unlock(&mut self, _data_id: LockDataId) {
-        self.locked = false;
-        self.transfer_manager.unlock();
-    }
+    fn on_unlock(&mut self, _data_id: LockDataId) {}
 }
 
 impl Drop for MacClipboardBackend {
@@ -363,11 +387,16 @@ impl MacClipboardFactory {
 
 impl CliprdrBackendFactory for MacClipboardFactory {
     fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        // Each session pastes into its own directory and removes only that one when it ends,
+        // so a reconnect cannot delete files another session just put on the pasteboard.
+        static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+        let session_dir = self.temp_dir.join(format!("session-{}-{n}", std::process::id()));
         Box::new(MacClipboardBackend::new(
             self.event_sender
                 .clone()
                 .expect("event sender not set before building clipboard backend"),
-            self.temp_dir.clone(),
+            session_dir,
             self.max_file_size,
         ))
     }

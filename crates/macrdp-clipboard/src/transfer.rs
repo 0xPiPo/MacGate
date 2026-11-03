@@ -6,29 +6,27 @@ use ironrdp_cliprdr::pdu::*;
 
 use crate::file::read_file_range;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RequestKind {
-    Size,
-    Data,
-}
 
-type StreamMapping = (u32, RequestKind);
+/// Bytes asked for per DATA request; larger files are fetched in successive chunks.
+const INCOMING_CHUNK: u64 = 4 * 1024 * 1024;
 
 pub struct FileTransferManager {
     local_files: Vec<PathBuf>,
     incoming_descriptors: Vec<FileDescriptor>,
     incoming_data: HashMap<u32, Vec<u8>>,
     incoming_complete: HashSet<u32>,
-    stream_to_index: HashMap<u32, StreamMapping>,
+    /// Outstanding DATA request stream id -> (file index, bytes requested).
+    stream_to_index: HashMap<u32, (u32, u32)>,
     temp_dir: PathBuf,
     max_file_size: u64,
-    locked: bool,
     next_stream_id: u32,
 }
 
 impl FileTransferManager {
     pub fn new(temp_dir: PathBuf, max_file_size: u64) -> Self {
-        fs::create_dir_all(&temp_dir).ok();
+        use std::os::unix::fs::DirBuilderExt;
+        // Owner-only: pasted files can be private.
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&temp_dir).ok();
         Self {
             local_files: Vec::new(),
             incoming_descriptors: Vec::new(),
@@ -37,7 +35,6 @@ impl FileTransferManager {
             stream_to_index: HashMap::new(),
             temp_dir,
             max_file_size,
-            locked: false,
             next_stream_id: 1,
         }
     }
@@ -125,8 +122,11 @@ impl FileTransferManager {
     pub fn generate_contents_requests(&mut self) -> Vec<FileContentsRequest> {
         let mut requests = Vec::new();
 
-        for (index, desc) in self.incoming_descriptors.iter().enumerate() {
-            if desc.file_size.unwrap_or(0) > self.max_file_size {
+        for index in 0..self.incoming_descriptors.len() {
+            let desc = &self.incoming_descriptors[index];
+            // `None`: the client did not send FD_FILESIZE; read until a short reply.
+            let size = desc.file_size;
+            if size.is_some_and(|size| size > self.max_file_size) {
                 tracing::warn!(
                     name = ?desc.name,
                     size = desc.file_size,
@@ -137,77 +137,103 @@ impl FileTransferManager {
                 self.incoming_complete.insert(index as u32);
                 continue;
             }
-            let size_stream = self.next_stream_id;
-            self.next_stream_id += 1;
-            self.stream_to_index
-                .insert(size_stream, (index as u32, RequestKind::Size));
-
-            requests.push(FileContentsRequest {
-                stream_id: size_stream,
-                index: index as u32,
-                flags: FileContentsFlags::SIZE,
-                position: 0,
-                requested_size: 8,
-                data_id: None,
-            });
-
-            let data_stream = self.next_stream_id;
-            self.next_stream_id += 1;
-            self.stream_to_index
-                .insert(data_stream, (index as u32, RequestKind::Data));
-
-            let size = desc.file_size.unwrap_or(0) as u32;
-            requests.push(FileContentsRequest {
-                stream_id: data_stream,
-                index: index as u32,
-                flags: FileContentsFlags::DATA,
-                position: 0,
-                requested_size: size,
-                data_id: None,
-            });
+            let is_dir = desc
+                .attributes
+                .is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY));
+            if is_dir {
+                tracing::debug!(name = ?desc.name, "Skipping directory entry in incoming file list");
+                self.incoming_complete.insert(index as u32);
+                continue;
+            }
+            // Entries inside a copied folder (`folder\\a.txt`) are not pasted: skip them before
+            // transferring their data, not after.
+            if safe_file_name(&desc.name).is_none() {
+                tracing::warn!(name = ?desc.name, "Skipping incoming file with a nested or unsafe path");
+                self.incoming_complete.insert(index as u32);
+                continue;
+            }
+            if size == Some(0) {
+                // Nothing to fetch; flush still writes the empty file.
+                self.incoming_data.insert(index as u32, Vec::new());
+                self.incoming_complete.insert(index as u32);
+                continue;
+            }
+            // The descriptor already carries the size, so no SIZE request is needed.
+            requests.push(self.data_request(index as u32, 0, size));
         }
 
         requests
     }
 
-    pub fn handle_contents_response(&mut self, response: &FileContentsResponse<'_>) {
+    /// Next DATA request for `index`, starting at `position` of a file of `size` bytes
+    /// (`None`: unknown, so a full chunk).
+    fn data_request(&mut self, index: u32, position: u64, size: Option<u64>) -> FileContentsRequest {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.wrapping_add(1);
+        // Bounded by INCOMING_CHUNK, so the cast cannot truncate.
+        let requested_size = size.map_or(INCOMING_CHUNK, |size| size.saturating_sub(position).min(INCOMING_CHUNK)) as u32;
+        self.stream_to_index.insert(stream_id, (index, requested_size));
+        FileContentsRequest {
+            stream_id,
+            index,
+            flags: FileContentsFlags::DATA,
+            position,
+            requested_size,
+            data_id: None,
+        }
+    }
+
+    /// Records a DATA response. Returns the request for the next chunk while the file is
+    /// still incomplete.
+    pub fn handle_contents_response(&mut self, response: &FileContentsResponse<'_>) -> Option<FileContentsRequest> {
         let stream_id = response.stream_id();
-        let Some(&(file_index, kind)) = self.stream_to_index.get(&stream_id) else {
+        let Some((file_index, requested)) = self.stream_to_index.remove(&stream_id) else {
             tracing::warn!(stream_id, "Unknown stream_id in file contents response");
-            return;
+            return None;
         };
 
-        if kind == RequestKind::Size {
-            return;
+        if self.incoming_complete.contains(&file_index) {
+            return None;
         }
 
         let data = response.data();
+        let expected = self.incoming_descriptors.get(file_index as usize).and_then(|d| d.file_size);
+        if data.is_empty() && expected.is_none() {
+            // Unknown size: an empty reply is the end of the file.
+            self.incoming_data.entry(file_index).or_default();
+            self.incoming_complete.insert(file_index);
+            return None;
+        }
         if data.is_empty() {
-            tracing::warn!(stream_id, file_index, "Empty data in file contents response");
-            return;
+            // An error response (or a truncated file): give up on this file so the rest of
+            // the paste still completes.
+            tracing::warn!(stream_id, file_index, "Empty data in file contents response, dropping file");
+            self.incoming_data.remove(&file_index);
+            self.incoming_complete.insert(file_index);
+            return None;
         }
 
-        if self.incoming_complete.contains(&file_index) {
-            return;
-        }
         let received = self.incoming_data.get(&file_index).map_or(0, Vec::len);
         if (received + data.len()) as u64 > self.max_file_size {
             tracing::warn!(file_index, max = self.max_file_size, "Incoming file exceeds the size limit, discarding it");
             self.incoming_data.remove(&file_index);
             self.incoming_complete.insert(file_index);
-            return;
+            return None;
         }
-        self.incoming_data
-            .entry(file_index)
-            .or_default()
-            .extend_from_slice(data);
+        let buf = self.incoming_data.entry(file_index).or_default();
+        buf.extend_from_slice(data);
+        let received = buf.len() as u64;
 
-        if let Some(desc) = self.incoming_descriptors.get(file_index as usize) {
-            let expected = desc.file_size.unwrap_or(0) as usize;
-            let received = self.incoming_data.get(&file_index).map_or(0, |d| d.len());
-            if received >= expected {
-                self.incoming_complete.insert(file_index);
-            }
+        // Known size: done once it all arrived. Unknown: a short reply is the end of the file.
+        let done = match expected {
+            Some(expected) => received >= expected,
+            None => data.len() < requested as usize,
+        };
+        if done {
+            self.incoming_complete.insert(file_index);
+            None
+        } else {
+            Some(self.data_request(file_index, received, expected))
         }
     }
 
@@ -222,14 +248,20 @@ impl FileTransferManager {
         for (index, desc) in self.incoming_descriptors.iter().enumerate() {
             let index = index as u32;
             if let Some(data) = self.incoming_data.remove(&index) {
-                if desc.name.contains("..") || desc.name.starts_with('/') || desc.name.starts_with('\\')
-                {
+                let Some(file_name) = safe_file_name(&desc.name) else {
                     tracing::warn!(name = ?desc.name, "Rejected file with suspicious path");
                     continue;
-                }
+                };
 
-                let file_path = self.temp_dir.join(&desc.name);
-                match fs::write(&file_path, &data) {
+                let file_path = self.temp_dir.join(file_name);
+                // create_new: never follow or overwrite whatever already sits at that name.
+                let _ = fs::remove_file(&file_path);
+                let written = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file_path)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, &data));
+                match written {
                     Ok(()) => {
                         tracing::debug!(path = ?file_path, bytes = data.len(), "Wrote incoming file");
                         paths.push(file_path);
@@ -247,19 +279,9 @@ impl FileTransferManager {
         paths
     }
 
-    pub fn lock(&mut self) {
-        self.locked = true;
-    }
-
-    pub fn unlock(&mut self) {
-        self.locked = false;
-        self.incoming_data.clear();
-        self.incoming_complete.clear();
-        self.stream_to_index.clear();
-    }
-
-    pub fn clear(&mut self) {
-        self.local_files.clear();
+    /// Abandons an incoming paste (a newer copy superseded it). Replies still on the way
+    /// then match no stream and are dropped.
+    pub fn cancel_incoming(&mut self) {
         self.incoming_descriptors.clear();
         self.incoming_data.clear();
         self.incoming_complete.clear();
@@ -267,13 +289,23 @@ impl FileTransferManager {
     }
 }
 
+/// A client-supplied name reduced to one plain path component, or `None` when it names a
+/// directory, a parent, or an absolute path.
+fn safe_file_name(name: &str) -> Option<&str> {
+    use std::path::{Component, Path};
+    if name.contains(['/', '\\', '\0']) {
+        return None;
+    }
+    match Path::new(name).components().collect::<Vec<_>>().as_slice() {
+        [Component::Normal(_)] => Some(name),
+        _ => None,
+    }
+}
+
 impl Drop for FileTransferManager {
     fn drop(&mut self) {
-        if let Ok(entries) = fs::read_dir(&self.temp_dir) {
-            for entry in entries.flatten() {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
+        // The directory is private to this session (see `MacClipboardFactory`).
+        let _ = fs::remove_dir_all(&self.temp_dir);
     }
 }
 
@@ -387,12 +419,11 @@ mod tests {
         mgr.set_incoming_descriptors(descriptors);
 
         let requests = mgr.generate_contents_requests();
-        assert_eq!(requests.len(), 4);
-        assert!(requests[0].flags.contains(FileContentsFlags::SIZE));
-        assert!(requests[1].flags.contains(FileContentsFlags::DATA));
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r.flags.contains(FileContentsFlags::DATA)));
 
-        let data_stream_a = requests[1].stream_id;
-        let data_stream_b = requests[3].stream_id;
+        let data_stream_a = requests[0].stream_id;
+        let data_stream_b = requests[1].stream_id;
 
         let resp_a = FileContentsResponse::new_data_response(data_stream_a, b"hello".to_vec());
         mgr.handle_contents_response(&resp_a);
@@ -452,16 +483,111 @@ mod tests {
     }
 
     #[test]
-    fn unlock_clears_state() {
-        let dir = temp_dir("unlock");
-        let mut mgr = FileTransferManager::new(dir.clone(), 1024 * 1024);
+    fn empty_and_directory_entries_complete_without_requests() {
+        let dir = temp_dir("empty");
+        let mut mgr = FileTransferManager::new(dir.clone(), 1024);
+        let folder = FileDescriptor {
+            name: "folder".to_string(),
+            file_size: Some(0),
+            attributes: Some(ClipboardFileAttributes::DIRECTORY),
+            last_write_time: None,
+        };
+        mgr.set_incoming_descriptors(vec![folder, descriptor("empty.txt", 0)]);
 
+        assert!(mgr.generate_contents_requests().is_empty());
+        assert!(mgr.all_incoming_complete());
+        let paths = mgr.flush_incoming_files();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("empty.txt"));
+        assert_eq!(fs::read(&paths[0]).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn short_reply_requests_the_rest() {
+        let dir = temp_dir("short");
+        let mut mgr = FileTransferManager::new(dir.clone(), 1024);
+        mgr.set_incoming_descriptors(vec![descriptor("a.txt", 5)]);
+        let requests = mgr.generate_contents_requests();
+        let data = requests.iter().find(|r| r.flags.contains(FileContentsFlags::DATA)).unwrap();
+
+        let next = mgr
+            .handle_contents_response(&FileContentsResponse::new_data_response(data.stream_id, b"he".to_vec()))
+            .expect("follow-up request");
+        assert_eq!((next.position, next.requested_size), (2, 3));
+        assert!(!mgr.all_incoming_complete());
+
+        let done = mgr.handle_contents_response(&FileContentsResponse::new_data_response(next.stream_id, b"llo".to_vec()));
+        assert!(done.is_none());
+        let paths = mgr.flush_incoming_files();
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "hello");
+    }
+
+    #[test]
+    fn unknown_size_reads_until_a_short_reply() {
+        let dir = temp_dir("unknown-size");
+        let mut mgr = FileTransferManager::new(dir.clone(), 64 * 1024 * 1024);
+        mgr.set_incoming_descriptors(vec![FileDescriptor {
+            name: "a.bin".to_string(),
+            file_size: None,
+            attributes: None,
+            last_write_time: None,
+        }]);
+        let first = mgr.generate_contents_requests().pop().expect("a request despite no size");
+        let chunk = vec![1u8; first.requested_size as usize];
+        let next = mgr
+            .handle_contents_response(&FileContentsResponse::new_data_response(first.stream_id, chunk))
+            .expect("a full chunk asks for more");
+        assert_eq!(next.position, u64::from(first.requested_size));
+        assert!(mgr.handle_contents_response(&FileContentsResponse::new_data_response(next.stream_id, b"end".to_vec())).is_none());
+        assert!(mgr.all_incoming_complete());
+        let paths = mgr.flush_incoming_files();
+        assert_eq!(fs::read(&paths[0]).unwrap().len(), first.requested_size as usize + 3);
+    }
+
+    #[test]
+    fn nested_folder_entries_are_never_requested() {
+        let dir = temp_dir("nested");
+        let mut mgr = FileTransferManager::new(dir.clone(), 1024);
+        mgr.set_incoming_descriptors(vec![descriptor("folder\\a.txt", 5), descriptor("../b.txt", 5)]);
+        assert!(mgr.generate_contents_requests().is_empty());
+        assert!(mgr.all_incoming_complete());
+        assert!(mgr.flush_incoming_files().is_empty());
+    }
+
+    #[test]
+    fn failed_reply_drops_only_that_file() {
+        let dir = temp_dir("failed");
+        let mut mgr = FileTransferManager::new(dir.clone(), 1024);
+        mgr.set_incoming_descriptors(vec![descriptor("a.txt", 5)]);
+        let requests = mgr.generate_contents_requests();
+        let data = requests.iter().find(|r| r.flags.contains(FileContentsFlags::DATA)).unwrap();
+
+        assert!(mgr.handle_contents_response(&FileContentsResponse::new_error(data.stream_id)).is_none());
+        assert!(mgr.all_incoming_complete());
+        assert!(mgr.flush_incoming_files().is_empty());
+    }
+
+    #[test]
+    fn file_names_are_single_components() {
+        assert_eq!(safe_file_name("a..b.txt"), Some("a..b.txt"));
+        assert_eq!(safe_file_name("report.pdf"), Some("report.pdf"));
+        for bad in ["..", ".", "", "../x", "a/b", "a\\b", "/etc/passwd"] {
+            assert_eq!(safe_file_name(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_paste_ignores_late_replies() {
+        let dir = temp_dir("cancel");
+        let mut mgr = FileTransferManager::new(dir.clone(), 1024 * 1024);
         mgr.set_local_files(vec![PathBuf::from("/tmp/fake")]);
-        mgr.lock();
-        assert!(mgr.locked);
-        mgr.unlock();
-        assert!(!mgr.locked);
-        assert!(mgr.incoming_data.is_empty());
+        mgr.set_incoming_descriptors(vec![descriptor("a.txt", 5)]);
+        let request = mgr.generate_contents_requests().pop().unwrap();
+        mgr.cancel_incoming();
+        let late = FileContentsResponse::new_data_response(request.stream_id, b"hello".to_vec());
+        assert!(mgr.handle_contents_response(&late).is_none());
+        assert!(!mgr.all_incoming_complete(), "nothing left to paste");
+        assert_eq!(mgr.local_files.len(), 1, "the Mac's own copy is untouched");
 
         fs::remove_dir_all(&dir).ok();
     }

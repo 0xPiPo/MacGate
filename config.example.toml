@@ -1,6 +1,7 @@
 # macrdp server configuration
 # Copy this file to config.toml and modify as needed.
-# Config search order: ./config.toml → ~/.config/macrdp/ → ~/Library/Application Support/macrdp/
+# Location: ~/Library/Application Support/macrdp/config.toml (shared by the app and the
+# command line; ~/.config/macrdp/config.toml is still read if the first does not exist).
 
 # ─── Network ───────────────────────────────────────────────────────────────────
 

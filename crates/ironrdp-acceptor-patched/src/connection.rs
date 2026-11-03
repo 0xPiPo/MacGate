@@ -40,6 +40,17 @@ pub struct Acceptor {
     client_name: Option<String>,
 }
 
+/// `creds` holds the NTLM secret derived from the owner's password hash. A connection that
+/// fails or times out before CredSSP finishes drops the acceptor without reaching the
+/// explicit zeroize after `credssp_loop`, so it is wiped here too.
+impl Drop for Acceptor {
+    fn drop(&mut self) {
+        if let Some(creds) = self.creds.as_mut() {
+            zeroize::Zeroize::zeroize(&mut creds.password);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AcceptorResult {
     pub static_channels: StaticChannelSet,
@@ -85,7 +96,7 @@ impl Acceptor {
         let AcceptorState::CapabilitiesSendServer {
             early_capability,
             channels,
-        } = consumed.saved_for_reactivation
+        } = mem::take(&mut consumed.saved_for_reactivation)
         else {
             return Err(general_err!("invalid acceptor state"));
         };
@@ -110,10 +121,10 @@ impl Acceptor {
             user_channel_id: consumed.user_channel_id,
             io_channel_id: consumed.io_channel_id,
             desktop_size,
-            server_capabilities: consumed.server_capabilities,
+            server_capabilities: mem::take(&mut consumed.server_capabilities),
             static_channels,
             saved_for_reactivation,
-            creds: consumed.creds,
+            creds: consumed.creds.take(),
             reactivation: true,
             desktop_scale_factor: consumed.desktop_scale_factor,
             client_name: consumed.client_name.clone(),

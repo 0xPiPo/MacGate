@@ -50,6 +50,7 @@ type VTCompressionOutputCallback = extern "C" fn(
     sample_buffer: CMSampleBufferRef,
 );
 
+#[allow(clippy::duplicated_attributes)] // one #[link] per framework
 #[link(name = "VideoToolbox", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
@@ -83,6 +84,7 @@ extern "C" {
         total_length_out: *mut usize, data_pointer_out: *mut *mut u8,
     ) -> OSStatus;
     fn CMBlockBufferGetDataLength(buf: *mut c_void) -> usize;
+    fn CMBlockBufferCopyDataBytes(buf: *mut c_void, offset: usize, length: usize, destination: *mut c_void) -> OSStatus;
     fn CMSampleBufferGetFormatDescription(sbuf: CMSampleBufferRef) -> *const c_void;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
         video_desc: *const c_void, index: usize,
@@ -124,6 +126,8 @@ extern "C" {
     fn CVPixelBufferRelease(pixel_buffer: CVPixelBufferRef);
     fn CVPixelBufferGetBaseAddressOfPlane(pixel_buffer: CVPixelBufferRef, plane_idx: usize) -> *mut c_void;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer: CVPixelBufferRef, plane_idx: usize) -> usize;
+    fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
+    fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
     fn VTCompressionSessionGetPixelBufferPool(session: VTCompressionSessionRef) -> *mut c_void; // CVPixelBufferPoolRef
     fn CVPixelBufferPoolCreatePixelBuffer(
         allocator: CFAllocatorRef,
@@ -183,7 +187,6 @@ const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
 const K_CF_NUMBER_FLOAT64_TYPE: i64 = 13;
 
 // Pixel format: BGRA
-const K_CV_PIXEL_FORMAT_32BGRA: u32 = 0x42475241; // 'BGRA'
 
 // Pixel format: NV12 (420f — YUV 4:2:0 biplanar, full range)
 // Full range (Y: 0-255) avoids the washed-out look of video range (Y: 16-235)
@@ -197,6 +200,46 @@ fn cf_i32(v: i32) -> CFTypeRef {
 }
 fn cf_f64(v: f64) -> CFTypeRef {
     unsafe { CFNumberCreate(std::ptr::null(), K_CF_NUMBER_FLOAT64_TYPE, &v as *const _ as *const c_void) }
+}
+
+/// A +1 CoreFoundation reference released on drop (null is allowed), so early `?` returns
+/// cannot leak it.
+struct CfOwned(CFTypeRef);
+
+impl Drop for CfOwned {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+
+/// A +1 CVPixelBuffer released on drop.
+struct PixelBufferOwned(CVPixelBufferRef);
+
+impl Drop for PixelBufferOwned {
+    fn drop(&mut self) {
+        unsafe { CVPixelBufferRelease(self.0) };
+    }
+}
+
+/// Sets a session property to a freshly created CF value and releases it (the session
+/// retains what it keeps).
+unsafe fn set_owned_property(session: VTCompressionSessionRef, key: CFStringRef, value: CFTypeRef) {
+    let value = CfOwned(value);
+    VTSessionSetProperty(session, key, value.0);
+}
+
+/// Frame options forcing an IDR, or none.
+fn frame_options(force_keyframe: bool) -> CfOwned {
+    if !force_keyframe {
+        return CfOwned(std::ptr::null());
+    }
+    unsafe {
+        let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+        let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+        CfOwned(CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), values.as_ptr(), 1, std::ptr::null(), std::ptr::null()))
+    }
 }
 
 // --- Callback context (shared between encoder thread and VT callback thread) ---
@@ -239,7 +282,7 @@ extern "C" fn encode_callback(
     }
 
     let mut annex_b = Vec::new();
-    let mut is_keyframe = false;
+    let is_keyframe;
 
     unsafe {
         let format_desc = CMSampleBufferGetFormatDescription(sample_buffer);
@@ -256,7 +299,20 @@ extern "C" fn encode_callback(
             signal_done(ctx, source, None);
             return;
         }
-        let data = std::slice::from_raw_parts(data_ptr, total_len);
+        // The pointer covers only `length` contiguous bytes; a block buffer made of several
+        // pieces is copied out whole instead of read past its first piece.
+        let copied;
+        let data: &[u8] = if length >= total_len {
+            std::slice::from_raw_parts(data_ptr, total_len)
+        } else {
+            let mut buf = vec![0u8; total_len];
+            if CMBlockBufferCopyDataBytes(block_buf, 0, total_len, buf.as_mut_ptr().cast()) != 0 {
+                signal_done(ctx, source, None);
+                return;
+            }
+            copied = buf;
+            &copied
+        };
 
         // First pass: check if any NAL is IDR (type 5) to determine keyframe
         let mut nal_header_len: i32 = 4;
@@ -267,25 +323,13 @@ extern "C" fn encode_callback(
                 &mut param_count, &mut nal_header_len,
             );
         }
-        let nal_len_size = if nal_header_len > 0 { nal_header_len as usize } else { 4 };
+        // AVCC length prefixes are 1, 2 or 4 bytes, as the format description says.
+        let nal_len_size = match nal_header_len {
+            1 | 2 | 4 => nal_header_len as usize,
+            _ => 4,
+        };
 
-        // Scan for IDR NAL to determine if this is a keyframe
-        {
-            let mut scan_offset = 0;
-            while scan_offset + nal_len_size <= total_len {
-                let nal_len = u32::from_be_bytes([
-                    data[scan_offset], data[scan_offset+1],
-                    data[scan_offset+2], data[scan_offset+3],
-                ]) as usize;
-                scan_offset += nal_len_size;
-                if scan_offset + nal_len > total_len { break; }
-                if nal_len > 0 {
-                    let nal_type = data[scan_offset] & 0x1F;
-                    if nal_type == 5 { is_keyframe = true; break; }
-                }
-                scan_offset += nal_len;
-            }
-        }
+        is_keyframe = avcc_nals(data, nal_len_size).any(|nal| nal[0] & 0x1F == 5);
 
         // SPS/PPS: only prepend for IDR frames (start of new coded video sequence).
         // Sending SPS/PPS before P-frames can cause decoders to reset their
@@ -315,25 +359,31 @@ extern "C" fn encode_callback(
         // Only keep VCL NALs (1=P-slice, 5=IDR) and parameter sets (7=SPS, 8=PPS).
         // Strip ALL other NAL types (SEI, AUD, filler, etc.) — VT's SEI may contain
         // Recovery Point info that causes Windows DXVA decoder to reset reference buffers.
-        let mut offset = 0;
-        while offset + nal_len_size <= total_len {
-            let nal_len = u32::from_be_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-            ]) as usize;
-            offset += nal_len_size;
-            if offset + nal_len > total_len { break; }
-            if nal_len > 0 {
-                let nal_type = data[offset] & 0x1F;
-                if matches!(nal_type, 1 | 5 | 7 | 8) {
-                    annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                    annex_b.extend_from_slice(&data[offset..offset + nal_len]);
-                }
+        for nal in avcc_nals(data, nal_len_size) {
+            if matches!(nal[0] & 0x1F, 1 | 5 | 7 | 8) {
+                annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                annex_b.extend_from_slice(nal);
             }
-            offset += nal_len;
         }
     }
 
     signal_done(ctx, source, Some((annex_b, is_keyframe)));
+}
+
+/// The non-empty NAL units of an AVCC buffer with `len_size`-byte big-endian length
+/// prefixes; stops at the first prefix that runs past the end.
+fn avcc_nals(data: &[u8], len_size: usize) -> impl Iterator<Item = &[u8]> {
+    let mut offset = 0;
+    std::iter::from_fn(move || loop {
+        let prefix = data.get(offset..offset + len_size)?;
+        let len = prefix.iter().fold(0usize, |n, &b| (n << 8) | usize::from(b));
+        let start = offset + len_size;
+        let nal = data.get(start..start.checked_add(len)?)?;
+        offset = start + len;
+        if !nal.is_empty() {
+            return Some(nal);
+        }
+    })
 }
 
 // --- YUV444 reusable buffers for AVC444 mode ---
@@ -359,32 +409,11 @@ impl Yuv444Buffers {
     }
 }
 
-/// Send-safe pointer wrappers for multi-threaded NV12 conversion.
-/// Safety: callers ensure the pointed-to memory is valid and disjoint per thread.
-#[derive(Clone, Copy)]
-struct SendPtr(usize);
-#[derive(Clone, Copy)]
-struct SendPtrMut(usize);
-unsafe impl Send for SendPtr {}
-unsafe impl Send for SendPtrMut {}
-unsafe impl Sync for SendPtr {}
-unsafe impl Sync for SendPtrMut {}
-impl SendPtr {
-    fn from(p: *const u8) -> Self { Self(p as usize) }
-    unsafe fn add(self, off: usize) -> *const u8 { (self.0 + off) as *const u8 }
-}
-impl SendPtrMut {
-    fn from(p: *mut u8) -> Self { Self(p as usize) }
-    unsafe fn add(self, off: usize) -> *mut u8 { (self.0 + off) as *mut u8 }
-}
-
 // --- Encoder ---
 
 pub struct VtEncoder {
     session: VTCompressionSessionRef,
-    session_aux: Option<VTCompressionSessionRef>,
     callback_ctx: Arc<CallbackCtx>,
-    callback_ctx_aux: Option<Arc<CallbackCtx>>,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -417,7 +446,6 @@ impl VtEncoder {
 
         // AVC444: single session, no aux session. Both streams use the same encoder
         // per MS-RDPEGFX requirement: "MUST be encoded using the same encoder".
-        let (session_aux, callback_ctx_aux) = (None::<VTCompressionSessionRef>, None::<Arc<CallbackCtx>>);
 
         let yuv444_buf = if mode_444 {
             Some(Yuv444Buffers::new(width, height))
@@ -440,9 +468,7 @@ impl VtEncoder {
 
         Ok(Self {
             session,
-            session_aux,
             callback_ctx,
-            callback_ctx_aux,
             width,
             height,
             frame_count: 0,
@@ -528,7 +554,7 @@ impl VtEncoder {
             VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxFrameDelayCount, cf_i32(0));
+            set_owned_property(session, kVTCompressionPropertyKey_MaxFrameDelayCount, cf_i32(0));
             // Temporal compression (P-frames) — do NOT set ReferenceBufferCount
             // (on Apple Silicon, setting it to 1 forces all-IDR)
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
@@ -540,11 +566,11 @@ impl VtEncoder {
             // VT will aim for this average but allow bursts for keyframes.
             // No DataRateLimits — hard ceiling starves first keyframe causing blur.
             // No EnableLowLatencyRateControl — it ignores AverageBitRate entirely.
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32));
+            set_owned_property(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
+            set_owned_property(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32));
             tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, "VT session bitrate set");
             // IDR every 5 seconds — less frequent keyframes reduce bandwidth spikes
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 5));
+            set_owned_property(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 5));
 
             // PrioritizeEncodingSpeedOverQuality (macOS 14+) — reduce encode latency
             {
@@ -574,10 +600,13 @@ impl VtEncoder {
         data: &[u8], src_w: u32, src_h: u32, stride: usize,
     ) -> Result<CVPixelBufferRef> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = enc_w as usize;
-        let h = enc_h as usize;
         let sw = src_w.min(enc_w) as usize;
         let sh = src_h.min(enc_h) as usize;
+        // The loop below reads `data` through raw pointers: check its extent first.
+        anyhow::ensure!(
+            sh == 0 || (stride >= sw * 4 && data.len() >= (sh - 1) * stride + sw * 4),
+            "BGRA buffer too short for {sw}x{sh} at stride {stride}"
+        );
 
         unsafe {
             let pool = VTCompressionSessionGetPixelBufferPool(session);
@@ -599,13 +628,15 @@ impl VtEncoder {
 
             // Single-pass BGRA→NV12: process row pairs (Y for 2 rows + UV for 1 row).
             // Single-threaded: thread spawn/join overhead per frame exceeds savings.
+            // An odd last row or column repeats its neighbour, so the edge is written too
+            // (the encoder is 16-aligned, so the extra destination row/column exists).
             let src = data.as_ptr();
-            let uv_w = sw / 2;
-            for pr in 0..(sh / 2) {
+            let uv_w = sw.div_ceil(2);
+            for pr in 0..sh.div_ceil(2) {
                 let r0 = pr * 2;
                 let r1 = r0 + 1;
                 let src_r0 = src.add(r0 * stride);
-                let src_r1 = src.add(r1 * stride);
+                let src_r1 = src.add(r1.min(sh - 1) * stride);
                 let y_dst0 = y_base.add(r0 * y_bpr);
                 let y_dst1 = y_base.add(r1 * y_bpr);
                 let uv_dst = uv_base.add(pr * uv_bpr);
@@ -613,10 +644,11 @@ impl VtEncoder {
                 for col in 0..uv_w {
                     let c0 = col * 2;
                     let c1 = c0 + 1;
+                    let c1_src = c1.min(sw - 1);
                     let p00 = src_r0.add(c0 * 4);
-                    let p01 = src_r0.add(c1 * 4);
+                    let p01 = src_r0.add(c1_src * 4);
                     let p10 = src_r1.add(c0 * 4);
-                    let p11 = src_r1.add(c1 * 4);
+                    let p11 = src_r1.add(c1_src * 4);
 
                     let (b00, g00, r00) = (*p00 as i32, *p00.add(1) as i32, *p00.add(2) as i32);
                     let (b01, g01, r01) = (*p01 as i32, *p01.add(1) as i32, *p01.add(2) as i32);
@@ -643,30 +675,38 @@ impl VtEncoder {
 
     /// Create NV12 CVPixelBuffer using vImage SIMD acceleration.
     /// Falls back to scalar create_nv12_from_bgra_fast if vImage unavailable.
+    #[allow(clippy::too_many_arguments)]
     fn create_nv12_vimage(
         &mut self,
         session: VTCompressionSessionRef,
         enc_w: u32, enc_h: u32,
         data: &[u8], src_w: u32, src_h: u32, stride: usize,
     ) -> Result<CVPixelBufferRef> {
+        let (w32, h32) = (src_w.min(enc_w), src_h.min(enc_h));
+        // vImage needs even sizes; an odd-sized frame takes the scalar path instead of
+        // failing every frame.
         let vimage = match &self.vimage {
-            Some(v) => v,
-            None => return Self::create_nv12_from_bgra_fast(session, enc_w, enc_h, data, src_w, src_h, stride),
+            Some(v) if w32.is_multiple_of(2) && h32.is_multiple_of(2) => v,
+            _ => return Self::create_nv12_from_bgra_fast(session, enc_w, enc_h, data, src_w, src_h, stride),
         };
 
-        let w = src_w.min(enc_w) as usize;
-        let h = src_h.min(enc_h) as usize;
+        let w = w32 as usize;
+        let h = h32 as usize;
         let y_size = w * h;
         let uv_size = w * h / 2;
 
         if self.nv12_y_buf.len() < y_size { self.nv12_y_buf.resize(y_size, 0); }
         if self.nv12_uv_buf.len() < uv_size { self.nv12_uv_buf.resize(uv_size, 0); }
 
-        vimage.bgra_to_nv12(
-            data, src_w, src_h, stride,
+        // The visible area only (a frame larger than the encoder is cropped, not an error).
+        if let Err(e) = vimage.bgra_to_nv12(
+            data, w32, h32, stride,
             &mut self.nv12_y_buf[..y_size],
             &mut self.nv12_uv_buf[..uv_size],
-        ).map_err(|e| anyhow::anyhow!("vImage bgra_to_nv12 failed: {e}"))?;
+        ) {
+            tracing::debug!("vImage bgra_to_nv12 failed ({e}), using the scalar path");
+            return Self::create_nv12_from_bgra_fast(session, enc_w, enc_h, data, src_w, src_h, stride);
+        }
 
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
         unsafe {
@@ -706,78 +746,6 @@ impl VtEncoder {
             CVPixelBufferUnlockBaseAddress(pb, 0);
         }
         Ok(pb)
-    }
-
-    /// Create a BGRA CVPixelBuffer with VT-managed memory and copy frame data into it.
-    fn create_bgra_pixelbuffer(
-        enc_w: u32, enc_h: u32,
-        data: &[u8], src_w: u32, src_h: u32, stride: usize,
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        unsafe {
-            let status = CVPixelBufferCreate(
-                std::ptr::null(),
-                enc_w as usize, enc_h as usize,
-                K_CV_PIXEL_FORMAT_32BGRA,
-                std::ptr::null(),
-                &mut pb,
-            );
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferCreate BGRA failed: {status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-            let base = CVPixelBufferGetBaseAddress(pb) as *mut u8;
-            let bpr = CVPixelBufferGetBytesPerRow(pb);
-            let copy_rows = (src_h as usize).min(enc_h as usize);
-            let copy_cols_bytes = (src_w as usize * 4).min(bpr);
-            for row in 0..copy_rows {
-                let src_start = row * stride;
-                let dst_start = row * bpr;
-                if src_start + copy_cols_bytes <= data.len() {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(src_start),
-                        base.add(dst_start),
-                        copy_cols_bytes,
-                    );
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-        Ok(pb)
-    }
-
-    /// Convert I420 (YUV420) frame to BGRA using BT.601 reverse transform.
-    fn yuv420_to_bgra(frame: &crate::yuv444_split::Yuv420Frame) -> Vec<u8> {
-        let w = frame.width as usize;
-        let h = frame.height as usize;
-        let uv_w = w / 2;
-        let mut bgra = vec![0u8; w * h * 4];
-
-        for row in 0..h {
-            for col in 0..w {
-                let y_idx = row * w + col;
-                let uv_idx = (row / 2) * uv_w + (col / 2);
-
-                let y = frame.y.get(y_idx).copied().unwrap_or(16) as i32;
-                let u = frame.u.get(uv_idx).copied().unwrap_or(128) as i32;
-                let v = frame.v.get(uv_idx).copied().unwrap_or(128) as i32;
-
-                let c = y - 16;
-                let d = u - 128;
-                let e = v - 128;
-                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-
-                let px = (row * w + col) * 4;
-                bgra[px] = b;
-                bgra[px + 1] = g;
-                bgra[px + 2] = r;
-                bgra[px + 3] = 255;
-            }
-        }
-        bgra
     }
 
     /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
@@ -869,6 +837,67 @@ impl VtEncoder {
 
     /// Allocate NV12 pixel buffer from VT session's pool (IOSurface-backed, hardware compatible)
     /// and fill with I420 plane data.
+    /// Copies the NV12 buffer `src` into a session-pool buffer of `enc_w` x `enc_h`, repeating
+    /// its last row and column into the padding (cropped by the client, but not garbage).
+    fn pad_nv12_into_pool(
+        session: VTCompressionSessionRef,
+        src: CVPixelBufferRef,
+        enc_w: u32, enc_h: u32,
+    ) -> Result<CVPixelBufferRef> {
+        let (dw, dh) = (enc_w as usize, enc_h as usize);
+        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
+        unsafe {
+            let pool = VTCompressionSessionGetPixelBufferPool(session);
+            if pool.is_null() { anyhow::bail!("VT pixel buffer pool is null"); }
+            let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
+            if status != 0 || pb.is_null() { anyhow::bail!("Pool alloc failed: {status}"); }
+            let dst = PixelBufferOwned(pb);
+
+            let (sw, sh) = (CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src));
+            if sw == 0 || sh == 0 {
+                anyhow::bail!("empty NV12 frame");
+            }
+            const READ_ONLY: u64 = 1; // kCVPixelBufferLock_ReadOnly
+            CVPixelBufferLockBaseAddress(src, READ_ONLY);
+            CVPixelBufferLockBaseAddress(dst.0, 0);
+            let planes = [
+                (CVPixelBufferGetBaseAddressOfPlane(src, 0) as *const u8, CVPixelBufferGetBytesPerRowOfPlane(src, 0),
+                 CVPixelBufferGetBaseAddressOfPlane(dst.0, 0) as *mut u8, CVPixelBufferGetBytesPerRowOfPlane(dst.0, 0),
+                 sw, sh, dw, dh, 1usize),
+                // CbCr: half the rows, the same bytes per row (two bytes per chroma sample).
+                (CVPixelBufferGetBaseAddressOfPlane(src, 1) as *const u8, CVPixelBufferGetBytesPerRowOfPlane(src, 1),
+                 CVPixelBufferGetBaseAddressOfPlane(dst.0, 1) as *mut u8, CVPixelBufferGetBytesPerRowOfPlane(dst.0, 1),
+                 sw.div_ceil(2) * 2, sh.div_ceil(2), dw, dh / 2, 2usize),
+            ];
+            let ok = planes.iter().all(|p| !p.0.is_null() && !p.2.is_null());
+            if ok {
+                for &(s_base, s_bpr, d_base, d_bpr, s_row_bytes, s_rows, d_row_bytes, d_rows, edge) in &planes {
+                    let copy = s_row_bytes.min(d_row_bytes).min(s_bpr).min(d_bpr);
+                    for row in 0..d_rows {
+                        let s_row = s_base.add(row.min(s_rows - 1) * s_bpr);
+                        let d_row = d_base.add(row * d_bpr);
+                        std::ptr::copy_nonoverlapping(s_row, d_row, copy);
+                        // Repeat the last sample across the padding columns.
+                        let fill = d_row_bytes.min(d_bpr);
+                        let mut col = copy;
+                        while col + edge <= fill && copy >= edge {
+                            std::ptr::copy_nonoverlapping(d_row.add(copy - edge), d_row.add(col), edge);
+                            col += edge;
+                        }
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(dst.0, 0);
+            CVPixelBufferUnlockBaseAddress(src, READ_ONLY);
+            if !ok {
+                anyhow::bail!("NV12 plane is null");
+            }
+            let raw = dst.0;
+            std::mem::forget(dst);
+            Ok(raw)
+        }
+    }
+
     fn create_nv12_from_session_pool(
         session: VTCompressionSessionRef,
         width: u32, height: u32,
@@ -1087,34 +1116,17 @@ impl VideoEncoder for VtEncoder {
         let duration = CMTime::make(frame_duration, 600);
 
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
-        let pixel_buffer = self.create_nv12_vimage(
+        let pixel_buffer = PixelBufferOwned(self.create_nv12_vimage(
             self.session, self.width, self.height, data, width, height, stride,
-        )?;
+        )?);
 
-        // Build frame properties dict to force IDR when requested
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
-                    1, std::ptr::null(), std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        // Force an IDR when requested
+        let frame_props = frame_options(std::mem::take(&mut self.pending_force_keyframe));
 
         let (nal_data, is_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, pixel_buffer, pts, duration, self.frame_count,
-            frame_props,
+            self.session, &self.callback_ctx, pixel_buffer.0, pts, duration, self.frame_count,
+            frame_props.0,
         )?;
-
-        if !frame_props.is_null() {
-            unsafe { CFRelease(frame_props); }
-        }
-        unsafe { CVPixelBufferRelease(pixel_buffer); }
 
         self.frame_count += 1;
 
@@ -1167,7 +1179,7 @@ impl VideoEncoder for VtEncoder {
             );
         }
 
-        if self.frame_count % 300 == 0 {
+        if self.frame_count.is_multiple_of(300) {
             tracing::debug!(
                 frame = self.frame_count,
                 output_bytes = nal_data.len(),
@@ -1184,6 +1196,8 @@ impl VideoEncoder for VtEncoder {
         })
     }
 
+    // The trait passes a CVPixelBufferRef that the caller keeps alive and valid for the call.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn encode_pixel_buffer(&mut self, pixel_buffer_ptr: *mut c_void, force_keyframe: bool) -> Result<EncodedFrame> {
         if force_keyframe {
             self.pending_force_keyframe = true;
@@ -1193,30 +1207,23 @@ impl VideoEncoder for VtEncoder {
         let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let duration = CMTime::make(frame_duration, 600);
 
-        // Build frame properties for force keyframe if needed
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
-                    1, std::ptr::null(), std::ptr::null(),
-                )
-            }
+        // Force an IDR when requested
+        let frame_props = frame_options(std::mem::take(&mut self.pending_force_keyframe));
+
+        // Zero-copy when the capture already has the session's (16-aligned) size; otherwise
+        // the frame is copied into a session-sized buffer, edge-padded, so VT neither scales
+        // nor rejects it (1080 rows into a 1088-row session).
+        let (src_w, src_h) = unsafe { (CVPixelBufferGetWidth(pixel_buffer_ptr), CVPixelBufferGetHeight(pixel_buffer_ptr)) };
+        let padded = if (src_w, src_h) == (self.width as usize, self.height as usize) {
+            None
         } else {
-            std::ptr::null()
+            Some(PixelBufferOwned(Self::pad_nv12_into_pool(self.session, pixel_buffer_ptr, self.width, self.height)?))
         };
-
-        // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
+        let input = padded.as_ref().map_or(pixel_buffer_ptr, |p| p.0);
         let (nal_data, is_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, pixel_buffer_ptr, pts, duration, self.frame_count,
-            frame_props,
+            self.session, &self.callback_ctx, input, pts, duration, self.frame_count,
+            frame_props.0,
         )?;
-
-        if !frame_props.is_null() {
-            unsafe { CFRelease(frame_props); }
-        }
 
         self.frame_count += 1;
 
@@ -1237,9 +1244,9 @@ impl VideoEncoder for VtEncoder {
 
         // Step 1: BGRA → YUV444 → B-area split (only needed for aux view)
         crate::yuv444_split::bgra_to_yuv444(
-            data, width, height, stride,
+            data, width.min(w), height.min(h), stride, w as usize,
             &mut bufs.y444, &mut bufs.u444, &mut bufs.v444,
-        );
+        )?;
         // Main view = standard YUV420, aux view = chroma compensation
         crate::yuv444_split::yuv444_split_to_yuv420(
             &bufs.y444, &bufs.u444, &bufs.v444,
@@ -1252,49 +1259,33 @@ impl VideoEncoder for VtEncoder {
         let duration = CMTime::make(frame_duration, 600);
 
         // Build frame properties dict to force IDR on both streams when requested
-        let frame_props = if self.pending_force_keyframe {
-            self.pending_force_keyframe = false;
-            unsafe {
-                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
-                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
-                    1, std::ptr::null(), std::ptr::null(),
-                )
-            }
-        } else {
-            std::ptr::null()
-        };
+        let frame_props = frame_options(std::mem::take(&mut self.pending_force_keyframe));
 
         // Step 2: Encode main view — standard YUV420 from B-area split
         let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let main_pb = Self::create_nv12_from_session_pool(
+        let main_pb = PixelBufferOwned(Self::create_nv12_from_session_pool(
             self.session, w, h,
             &bufs.main_view.y, &bufs.main_view.u, &bufs.main_view.v,
-        )?;
+        )?);
         let (main_nal, main_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, main_pb, main_pts, duration, self.frame_count,
-            frame_props,
+            self.session, &self.callback_ctx, main_pb.0, main_pts, duration, self.frame_count,
+            frame_props.0,
         )?;
-        unsafe { CVPixelBufferRelease(main_pb); }
+        drop(main_pb);
 
         // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
         // Force IDR on aux too if main was forced, to keep both streams in sync
         self.frame_count += 1;
         let aux_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let aux_pb = Self::create_nv12_from_session_pool(
+        let aux_pb = PixelBufferOwned(Self::create_nv12_from_session_pool(
             self.session, w, h,
             &bufs.aux_view.y, &bufs.aux_view.u, &bufs.aux_view.v,
-        )?;
+        )?);
         let (aux_nal, aux_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, aux_pb, aux_pts, duration, self.frame_count,
-            frame_props,
+            self.session, &self.callback_ctx, aux_pb.0, aux_pts, duration, self.frame_count,
+            frame_props.0,
         )?;
-        unsafe { CVPixelBufferRelease(aux_pb); }
-
-        if !frame_props.is_null() {
-            unsafe { CFRelease(frame_props); }
-        }
+        drop(aux_pb);
 
         self.frame_count += 1;
 
@@ -1321,7 +1312,7 @@ impl VideoEncoder for VtEncoder {
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {
         unsafe {
-            VTSessionSetProperty(self.session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate_bps as i32));
+            set_owned_property(self.session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate_bps as i32));
         }
         tracing::debug!(bitrate_mbps = bitrate_bps as f64 / 1_000_000.0, "VideoToolbox bitrate updated");
     }
@@ -1343,9 +1334,8 @@ impl Drop for VtEncoder {
     fn drop(&mut self) {
         unsafe {
             VTCompressionSessionInvalidate(self.session);
-            if let Some(aux) = self.session_aux {
-                VTCompressionSessionInvalidate(aux);
-            }
+            // VTCompressionSessionCreate returned it +1.
+            CFRelease(self.session as *const c_void);
         }
     }
 }
@@ -1365,9 +1355,22 @@ mod tests {
     }
 
     #[test]
+    fn avcc_nals_honours_the_prefix_size_and_bounds() {
+        let four = [0, 0, 0, 2, 0x65, 0xAA, 0, 0, 0, 0, 0, 0, 0, 1, 0x41];
+        let nals: Vec<&[u8]> = avcc_nals(&four, 4).collect();
+        assert_eq!(nals, [&[0x65, 0xAA][..], &[0x41][..]], "empty NALs are skipped");
+        let two = [0, 1, 0x67, 0, 1, 0x68];
+        assert_eq!(avcc_nals(&two, 2).count(), 2);
+        // A length running past the end stops the walk instead of indexing out of bounds.
+        assert_eq!(avcc_nals(&[0, 0, 0, 9, 1, 2], 4).count(), 0);
+        assert_eq!(avcc_nals(&[0xFF, 0xFF, 0xFF, 0xFF], 4).count(), 0);
+    }
+
+    #[test]
     fn late_callback_does_not_fill_next_slot() {
         let c = ctx(2);
         let ref_con = &c as *const CallbackCtx as *mut c_void;
+        #[allow(clippy::manual_dangling_ptr)] // distinct fake tags, never dereferenced
         encode_callback(ref_con, 1 as *mut c_void, -1, 0, std::ptr::null());
         assert!(!c.has_data.load(Ordering::Acquire));
         encode_callback(ref_con, 2 as *mut c_void, -1, 0, std::ptr::null());

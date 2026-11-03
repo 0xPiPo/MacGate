@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use macrdp_core::{ConfigUpdate, ConnectionEvent, LogEntry, Metrics, PermissionStatus, ServerConfig, ServerEventHandler, ServerStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use zeroize::Zeroizing;
 
@@ -37,26 +37,40 @@ pub enum Event {
     Log(LogEntry),
     /// Physical displays the app covers for the curtain (empty: none).
     Shield(Vec<u32>),
+    /// An event from the server instance started as `generation`; ignored once that
+    /// instance was stopped, so a queued error cannot stop the next one.
+    Tagged(u64, Box<Event>),
 }
 
-/// The `ServerEventHandler` given to the server: forwards every event to the control loop.
-pub struct EventSink(pub UnboundedSender<Event>);
+/// The `ServerEventHandler` given to the server: forwards every event to the control loop,
+/// tagged with the server instance it came from.
+pub struct EventSink {
+    pub tx: UnboundedSender<Event>,
+    pub generation: u64,
+}
+
+impl EventSink {
+    fn send(&self, event: Event) {
+        let _ = self.tx.send(Event::Tagged(self.generation, Box::new(event)));
+    }
+}
 
 impl ServerEventHandler for EventSink {
     fn on_status_change(&self, status: ServerStatus) {
-        let _ = self.0.send(Event::Status(status));
+        self.send(Event::Status(status));
     }
     fn on_metrics(&self, metrics: Metrics) {
-        let _ = self.0.send(Event::Metrics(metrics));
+        self.send(Event::Metrics(metrics));
     }
     fn on_connection(&self, event: ConnectionEvent) {
-        let _ = self.0.send(Event::Connection(event));
+        self.send(Event::Connection(event));
     }
     fn on_log(&self, entry: LogEntry) {
-        let _ = self.0.send(Event::Log(entry));
+        // Logs are worth showing whichever instance wrote them.
+        let _ = self.tx.send(Event::Log(entry));
     }
     fn on_shield_displays(&self, displays: Vec<u32>) {
-        let _ = self.0.send(Event::Shield(displays));
+        self.send(Event::Shield(displays));
     }
 }
 
@@ -68,6 +82,13 @@ pub struct AuthInfo {
     pub reenroll_needed: bool,
     /// SHA-256 of the TLS certificate (public).
     pub fingerprint: Option<String>,
+}
+
+/// A `test_standby` waiting for its wake time; the reply goes out when it ends.
+struct StandbyTest {
+    id: Option<u64>,
+    monitors: usize,
+    wake_at: tokio::time::Instant,
 }
 
 /// A running server.
@@ -172,6 +193,13 @@ pub(crate) struct Controller<B: Backend, W: Write> {
     config_error: Option<String>,
     events: UnboundedSender<Event>,
     server: Option<B::Server>,
+    /// The config the running server was started with: a restart is needed only for a key
+    /// whose value now differs from it.
+    started_config: Option<ServerConfig>,
+    /// Bumped on every start and stop; see [`Event::Tagged`].
+    server_generation: u64,
+    /// A `test_standby` in progress: the monitors sleep until the deadline, then wake.
+    standby_test: Option<StandbyTest>,
     state: State,
     error: Option<String>,
     session: Option<Session>,
@@ -179,12 +207,35 @@ pub(crate) struct Controller<B: Backend, W: Write> {
     /// with: it clears only when the display configuration is restored.
     shield: Vec<u32>,
     last_metrics: Option<Instant>,
+    /// stdout failed (the app went away): stop writing, so the warning about it is not
+    /// forwarded as a log message whose write fails again, without end.
+    out_broken: bool,
+}
+
+/// The value at a dotted config key (`"audio.enabled"`), for comparing two configs.
+fn key_value(config: &ServerConfig, key: &str) -> Option<Value> {
+    let value = serde_json::to_value(config).ok()?;
+    value.pointer(&format!("/{}", key.replace('.', "/"))).cloned()
 }
 
 impl<B: Backend, W: Write> Controller<B, W> {
     /// Loads the config; a missing file is created with the defaults (mode 0600).
+    #[cfg(test)]
     pub fn new(backend: B, out: W, config_path: PathBuf, events: UnboundedSender<Event>) -> Self {
-        let (config, config_error) = match config_store::load(&config_path) {
+        let loaded = config_store::load(&config_path);
+        Self::with_loaded(backend, out, config_path, events, loaded)
+    }
+
+    /// Takes the result of loading `config_path`; a missing file is created with the
+    /// defaults (mode 0600).
+    pub fn with_loaded(
+        backend: B,
+        out: W,
+        config_path: PathBuf,
+        events: UnboundedSender<Event>,
+        loaded: anyhow::Result<ServerConfig>,
+    ) -> Self {
+        let (config, config_error) = match loaded {
             Ok(config) => (config, None),
             Err(e) => {
                 tracing::error!(path = %config_path.display(), "Invalid config file, using defaults and leaving it untouched: {e:#}");
@@ -204,16 +255,23 @@ impl<B: Backend, W: Write> Controller<B, W> {
             config_error,
             events,
             server: None,
+            started_config: None,
+            server_generation: 0,
+            standby_test: None,
             state: State::Stopped,
             error: None,
             session: None,
             shield: Vec::new(),
             last_metrics: None,
+            out_broken: false,
         }
     }
 
     /// Writes one message line. Oversize messages are dropped (logged to the file only).
     fn emit(&mut self, message: Value) {
+        if self.out_broken {
+            return;
+        }
         let Ok(line) = serde_json::to_string(&message) else { return };
         if line.len() > MAX_MESSAGE {
             tracing::warn!(len = line.len(), "Dropping an oversize control message");
@@ -221,7 +279,8 @@ impl<B: Backend, W: Write> Controller<B, W> {
         }
         let written = writeln!(self.out, "{line}").and_then(|()| self.out.flush());
         if let Err(e) = written {
-            tracing::warn!("Cannot write to the app: {e}");
+            self.out_broken = true;
+            tracing::warn!("Cannot write to the app, no further messages are sent: {e}");
         }
     }
 
@@ -368,13 +427,47 @@ impl<B: Backend, W: Write> Controller<B, W> {
                 if self.session.is_some() {
                     return self.reply(id, Err("cannot test monitor standby during a session".into()), None);
                 }
+                if self.standby_test.is_some() {
+                    return self.reply(id, Err("a monitor standby test is already running".into()), None);
+                }
+                // The wake is scheduled, not slept here, so the loop keeps serving events: a
+                // session that starts meanwhile is seen before the monitors are woken.
                 let monitors = self.backend.monitor_power(false);
-                tokio::time::sleep(STANDBY_TEST).await;
-                self.backend.monitor_power(true);
-                self.emit(json!({ "type": "reply", "id": id, "ok": true, "monitors": monitors }));
+                self.standby_test = Some(StandbyTest { id, monitors, wake_at: tokio::time::Instant::now() + STANDBY_TEST });
             }
             _ => self.reply(id, Err("unknown command".into()), None),
         }
+    }
+
+    /// When the running standby test should wake the monitors.
+    fn standby_wake_at(&self) -> Option<tokio::time::Instant> {
+        self.standby_test.as_ref().map(|t| t.wake_at)
+    }
+
+    /// Ends the standby test: wakes the monitors unless a curtain session that sleeps them
+    /// (`curtain_standby_ok`) started meanwhile and now owns them, then replies.
+    fn finish_standby_test(&mut self) {
+        let Some(test) = self.standby_test.take() else { return };
+        let curtain_sleeps_them = self.session.as_ref().is_some_and(|s| s.display_mode == "curtain")
+            && self.config.curtain_standby_ok == Some(true);
+        if !curtain_sleeps_them {
+            self.backend.monitor_power(true);
+        }
+        self.emit(json!({ "type": "reply", "id": test.id, "ok": true, "monitors": test.monitors }));
+    }
+
+    /// Waits for the standby test's wake time (forever when none runs), then finishes it.
+    #[cfg(test)]
+    async fn standby_tick(&mut self) {
+        if let Some(at) = self.standby_wake_at() {
+            tokio::time::sleep_until(at).await;
+            self.finish_standby_test();
+        }
+    }
+
+    /// A command line over [`MAX_MESSAGE`] was discarded unread.
+    fn reject_oversize(&mut self) {
+        self.reply(None, Err("message too large".into()), None);
     }
 
     fn permission(&self, which: Option<&str>, action: impl Fn(&B, &str) -> anyhow::Result<()>) -> Result<(), String> {
@@ -384,17 +477,39 @@ impl<B: Backend, W: Write> Controller<B, W> {
         }
     }
 
+    /// Re-reads the config file, so hand edits made while the helper runs are neither lost
+    /// nor ignored, and a fixed file clears an earlier error. While the file is invalid the
+    /// helper refuses to start or save rather than fall back to looser defaults.
+    fn reload_config(&mut self) -> Result<(), String> {
+        match config_store::load(&self.config_path) {
+            Ok(config) => {
+                self.config = config;
+                self.config_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                let error = format!("{} is invalid: {e}", self.config_path.display());
+                self.config_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
     async fn start(&mut self) -> Result<(), String> {
         if self.server.is_some() {
             return Ok(());
         }
+        self.reload_config()?;
         self.state = State::Starting;
         self.error = None;
         self.emit_status();
-        let result = self.backend.start(self.config.clone(), EventSink(self.events.clone())).await;
+        self.server_generation += 1;
+        let sink = EventSink { tx: self.events.clone(), generation: self.server_generation };
+        let result = self.backend.start(self.config.clone(), sink).await;
         match result {
             Ok(server) => {
                 self.server = Some(server);
+                self.started_config = Some(self.config.clone());
                 self.state = State::Listening;
                 self.emit_status();
                 Ok(())
@@ -412,6 +527,8 @@ impl<B: Backend, W: Write> Controller<B, W> {
 
     /// Stops the server; the session teardown restores the Mac's displays.
     async fn stop(&mut self) {
+        self.started_config = None;
+        self.server_generation += 1;
         if let Some(server) = self.server.take() {
             if let Err(e) = server.stop().await {
                 tracing::warn!("Server stop: {e:#}");
@@ -420,7 +537,9 @@ impl<B: Backend, W: Write> Controller<B, W> {
         self.state = State::Stopped;
         self.error = None;
         self.last_metrics = None;
-        if self.session.take().is_some() {
+        // The server and its displays are gone: nothing is left for the app to cover.
+        let had_shield = !std::mem::take(&mut self.shield).is_empty();
+        if self.session.take().is_some() || had_shield {
             self.emit_session();
         }
         self.emit_status();
@@ -428,9 +547,7 @@ impl<B: Backend, W: Write> Controller<B, W> {
 
     /// Returns whether the change needs a server restart.
     fn set_config(&mut self, key: &str, value: &Value) -> Result<bool, String> {
-        if let Some(error) = &self.config_error {
-            return Err(error.clone());
-        }
+        self.reload_config()?;
         let mut config = self.config.clone();
         let effect = config_store::apply(&mut config, key, value)?;
         config_store::save(&self.config_path, &config).map_err(|e| format!("cannot save the config: {e}"))?;
@@ -445,13 +562,28 @@ impl<B: Backend, W: Write> Controller<B, W> {
                 }
                 false
             }
-            Effect::Restart => self.server.is_some(),
+            // Re-sending the running value (Enter in an unchanged field, or a toggle flipped
+            // back) needs no restart.
+            Effect::Restart => self
+                .started_config
+                .as_ref()
+                .is_some_and(|started| key_value(started, key) != key_value(&self.config, key)),
         };
         self.emit_config();
         Ok(restart)
     }
 
     pub async fn handle_event(&mut self, event: Event) {
+        let event = match event {
+            // A stopped server's events are stale, except clearing the shield: its display
+            // teardown reports that after stop() has already moved on.
+            Event::Tagged(generation, event) if generation != self.server_generation => match *event {
+                Event::Shield(displays) if displays.is_empty() => Event::Shield(displays),
+                _ => return,
+            },
+            Event::Tagged(_, event) => *event,
+            event => event,
+        };
         match event {
             Event::Status(status) if status.state.starts_with("error") => {
                 // The server thread died: drop it so `start` works again.
@@ -513,10 +645,14 @@ impl<B: Backend, W: Write> Controller<B, W> {
                     self.emit_session();
                 }
             }
+            // Unwrapped above; a server never tags twice.
+            Event::Tagged(..) => {}
         }
     }
 
     pub async fn shutdown(&mut self) {
+        // Never leave the monitors asleep because the helper is going away.
+        self.finish_standby_test();
         self.stop().await;
     }
 }
@@ -533,14 +669,13 @@ pub(crate) async fn run<B, W, R>(
     R: tokio::io::AsyncBufRead + Unpin,
 {
     tokio::pin!(shutdown);
-    let mut lines = input.lines();
+    let mut lines = CommandLines::new(input);
     loop {
+        let standby_wake = controller.standby_wake_at();
         tokio::select! {
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    let line = Zeroizing::new(line);
-                    controller.handle_line(&line).await;
-                }
+            line = lines.next() => match line {
+                Ok(Some(Line::Text(line))) => controller.handle_line(&line).await,
+                Ok(Some(Line::TooLong)) => controller.reject_oversize(),
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!("Cannot read commands: {e}");
@@ -548,10 +683,81 @@ pub(crate) async fn run<B, W, R>(
                 }
             },
             Some(event) = events.recv() => controller.handle_event(event).await,
+            () = tokio::time::sleep_until(standby_wake.unwrap_or_else(tokio::time::Instant::now)), if standby_wake.is_some() => {
+                controller.finish_standby_test();
+            }
             () = &mut shutdown => break,
         }
     }
     controller.shutdown().await;
+}
+
+enum Line {
+    Text(Zeroizing<String>),
+    /// Longer than [`MAX_MESSAGE`]; its bytes were discarded, never buffered whole.
+    TooLong,
+}
+
+/// Newline-delimited commands, buffering at most [`MAX_MESSAGE`] + 1 bytes of one line.
+/// Cancel-safe: a partly read line stays in `buf` for the next call.
+struct CommandLines<R> {
+    input: R,
+    buf: Zeroizing<Vec<u8>>,
+    /// Skipping the rest of an oversize line.
+    discarding: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> CommandLines<R> {
+    fn new(input: R) -> Self {
+        Self { input, buf: Zeroizing::new(Vec::new()), discarding: false }
+    }
+
+    /// The next line, or `None` at end of input.
+    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+        loop {
+            if self.discarding {
+                let mut skipped = Vec::new();
+                let n = (&mut self.input).take(MAX_MESSAGE as u64).read_until(b'\n', &mut skipped).await?;
+                if n == 0 {
+                    self.discarding = false;
+                    return Ok(None);
+                }
+                if skipped.ends_with(b"\n") {
+                    self.discarding = false;
+                    return Ok(Some(Line::TooLong));
+                }
+                continue;
+            }
+            let limit = (MAX_MESSAGE + 1).saturating_sub(self.buf.len()) as u64;
+            let n = (&mut self.input).take(limit).read_until(b'\n', &mut self.buf).await?;
+            let complete = self.buf.ends_with(b"\n");
+            if n == 0 && self.buf.is_empty() {
+                return Ok(None);
+            }
+            if complete || n == 0 {
+                // A full line, or the last one at end of input.
+                let mut bytes = std::mem::take(&mut *self.buf);
+                while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                    bytes.pop();
+                }
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        let mut bytes = e.into_bytes();
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        zeroize::Zeroize::zeroize(&mut bytes);
+                        text
+                    }
+                };
+                return Ok(Some(Line::Text(Zeroizing::new(text))));
+            }
+            if self.buf.len() > MAX_MESSAGE {
+                zeroize::Zeroize::zeroize(&mut *self.buf);
+                self.buf.clear();
+                self.discarding = true;
+            }
+        }
+    }
 }
 
 /// Forwards log events at or above a level to the app as `log` messages.
@@ -847,6 +1053,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_config_refuses_start_until_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "bind_address = \"10.8.0.2\"\nport = \"broken\"").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = Shared::default();
+        let mut ctrl = Controller::new(Fake::default(), out.clone(), path.clone(), tx);
+
+        // Starting on defaults would listen on 0.0.0.0 instead of the configured address.
+        ctrl.handle_line(r#"{"id":1,"cmd":"start"}"#).await;
+        assert_eq!(messages(&out.bytes()).pop().unwrap()["ok"], false);
+        assert!(ctrl.server.is_none());
+
+        std::fs::write(&path, "bind_address = \"10.8.0.2\"\nport = 3390").unwrap();
+        ctrl.handle_line(r#"{"id":2,"cmd":"start"}"#).await;
+        assert_eq!(messages(&out.bytes()).pop().unwrap()["ok"], true);
+        assert_eq!(ctrl.config.bind_address, "10.8.0.2");
+        assert_eq!(ctrl.config.port, 3390);
+    }
+
+    #[tokio::test]
     async fn unknown_command_gets_ok_false_with_its_id() {
         let mut r = rig();
         r.ctrl.handle_line(r#"{"id":7,"cmd":"fly","extra":1}"#).await;
@@ -938,6 +1165,11 @@ mod tests {
 
         r.ctrl.handle_line(r#"{"id":4,"cmd":"set_config","key":"port","value":3390}"#).await;
         assert_eq!(r.last_reply()["restart_required"], true);
+        // Back to the value the server runs with: nothing to restart for.
+        r.ctrl.handle_line(r#"{"id":41,"cmd":"set_config","key":"port","value":3389}"#).await;
+        assert_eq!(r.last_reply()["restart_required"], false);
+        r.ctrl.handle_line(r#"{"id":42,"cmd":"set_config","key":"audio.enabled","value":true}"#).await;
+        assert_eq!(r.last_reply()["restart_required"], false, "unchanged nested key");
 
         r.ctrl.handle_line(r#"{"id":5,"cmd":"set_config","key":"log_level","value":"debug"}"#).await;
         assert_eq!(r.last_reply()["restart_required"], false);
@@ -980,6 +1212,7 @@ mod tests {
         let mut r = rig_with(Fake { monitors: 2, ..Fake::default() });
         let started = tokio::time::Instant::now();
         r.ctrl.handle_line(r#"{"id":1,"cmd":"test_standby"}"#).await;
+        r.ctrl.standby_tick().await;
         assert_eq!(started.elapsed(), Duration::from_secs(3));
         let reply = r.last_reply();
         assert_eq!((reply["id"].clone(), reply["ok"].clone(), reply["monitors"].clone()), (json!(1), json!(true), json!(2)));
@@ -990,6 +1223,7 @@ mod tests {
     async fn test_standby_reports_zero_monitors_and_still_wakes() {
         let mut r = rig();
         r.ctrl.handle_line(r#"{"id":1,"cmd":"test_standby"}"#).await;
+        r.ctrl.standby_tick().await;
         assert_eq!((r.last_reply()["ok"].clone(), r.last_reply()["monitors"].clone()), (json!(true), json!(0)));
         assert_eq!(r.calls.lock().unwrap().power.len(), 2);
     }
@@ -1002,6 +1236,71 @@ mod tests {
         r.ctrl.handle_line(r#"{"id":2,"cmd":"test_standby"}"#).await;
         assert_eq!(r.last_reply()["ok"], false);
         assert!(r.calls.lock().unwrap().power.is_empty(), "a curtain's monitors are never touched");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn standby_test_still_wakes_monitors_for_a_session_that_does_not_sleep_them() {
+        let mut r = rig_with(Fake { monitors: 1, ..Fake::default() });
+        r.ctrl.handle_line(r#"{"id":1,"cmd":"set_config","key":"display_mode","value":"extend"}"#).await;
+        r.ctrl.handle_line(r#"{"id":2,"cmd":"start"}"#).await;
+        r.ctrl.handle_line(r#"{"id":3,"cmd":"test_standby"}"#).await;
+        r.ctrl.handle_event(connected()).await;
+        r.ctrl.standby_tick().await;
+        assert_eq!(r.calls.lock().unwrap().power, [false, true]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn standby_test_does_not_wake_monitors_for_a_session_that_started_meanwhile() {
+        let mut r = rig_with(Fake { monitors: 1, ..Fake::default() });
+        r.ctrl.handle_line(r#"{"id":0,"cmd":"set_config","key":"curtain_standby_ok","value":true}"#).await;
+        r.ctrl.handle_line(r#"{"id":1,"cmd":"start"}"#).await;
+        r.ctrl.handle_line(r#"{"id":2,"cmd":"test_standby"}"#).await;
+        r.ctrl.handle_event(connected()).await;
+        r.ctrl.standby_tick().await;
+        assert_eq!(r.last_reply()["ok"], true);
+        assert_eq!(r.calls.lock().unwrap().power, [false], "the session now owns the displays");
+    }
+
+    #[tokio::test]
+    async fn stopping_clears_the_shield_even_if_the_teardown_event_is_late() {
+        let mut r = rig();
+        r.ctrl.handle_line(r#"{"id":1,"cmd":"start"}"#).await;
+        let started = r.ctrl.server_generation;
+        r.ctrl.handle_event(Event::Tagged(started, Box::new(Event::Shield(vec![1, 4])))).await;
+        assert_eq!(r.of_type("session").pop().unwrap()["shield_displays"], json!([1, 4]));
+
+        r.ctrl.handle_line(r#"{"id":2,"cmd":"stop"}"#).await;
+        assert_eq!(r.of_type("session").pop().unwrap()["shield_displays"], json!([]));
+        // The old server's own clear arrives after the stop: still applied, never re-covers.
+        r.ctrl.handle_event(Event::Tagged(started, Box::new(Event::Shield(Vec::new())))).await;
+        r.ctrl.handle_event(Event::Tagged(started, Box::new(Event::Shield(vec![2])))).await;
+        assert!(r.ctrl.shield.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_from_a_stopped_server_are_ignored() {
+        let mut r = rig();
+        r.ctrl.handle_line(r#"{"id":1,"cmd":"start"}"#).await;
+        let old = r.ctrl.server_generation;
+        r.ctrl.handle_line(r#"{"id":2,"cmd":"stop"}"#).await;
+        r.ctrl.handle_line(r#"{"id":3,"cmd":"start"}"#).await;
+        let stale = Event::Status(ServerStatus { running: false, state: "error: old".into(), uptime_secs: 0 });
+        r.ctrl.handle_event(Event::Tagged(old, Box::new(stale))).await;
+        assert!(r.ctrl.server.is_some(), "the new server keeps running");
+        assert_eq!(r.calls.lock().unwrap().stopped, 1);
+    }
+
+    #[tokio::test]
+    async fn oversize_lines_are_discarded_without_buffering_them() {
+        let mut input = Vec::new();
+        input.extend(vec![b'x'; MAX_MESSAGE * 3]);
+        input.extend_from_slice(b"\n{\"id\":1}\r\nlast");
+        let mut lines = CommandLines::new(&input[..]);
+        assert!(matches!(lines.next().await.unwrap(), Some(Line::TooLong)));
+        assert!(lines.buf.capacity() <= MAX_MESSAGE * 2);
+        assert!(matches!(lines.next().await.unwrap(), Some(Line::Text(t)) if t.as_str() == r#"{"id":1}"#));
+        assert!(matches!(lines.next().await.unwrap(), Some(Line::Text(t)) if t.as_str() == "last"));
+        assert!(lines.next().await.unwrap().is_none());
     }
 
     fn connected() -> Event {

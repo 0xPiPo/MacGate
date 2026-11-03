@@ -28,8 +28,9 @@ app:
 	codesign --verify --strict --deep $(APP_OUT)
 	@echo "Built $(APP_OUT)"
 
+# A config.toml in the repo root (gitignored) is used when present.
 run:
-	cargo run --release -p macrdp-server
+	cargo run --release -p macrdp-server -- $(if $(wildcard config.toml),--config config.toml)
 
 # The patched IronRDP crates are [patch] path crates, not workspace members.
 test:

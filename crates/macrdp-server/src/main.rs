@@ -20,8 +20,8 @@ struct Cli {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Target frame rate (30, 60, or 120)
-    #[arg(long)]
+    /// Target frame rate, 1-120 (the app offers 15, 30 or 60)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=120))]
     frame_rate: Option<u32>,
 
     /// Log level: trace, debug, info, warn, error
@@ -84,15 +84,14 @@ async fn main() -> Result<()> {
 
 /// The app's helper. Stdout carries protocol JSON only; tracing goes to the log file.
 async fn run_control(config: Option<PathBuf>) -> Result<()> {
-    let path = match config {
-        Some(path) => path,
-        None => config_store::default_path()?,
-    };
-    let level = config_store::load(&path).ok().and_then(|c| c.log_level);
+    let path = config.unwrap_or_else(config_store::default_path);
+    // Read once: the level is needed before logging starts, the rest by the controller.
+    let loaded = config_store::load(&path);
+    let level = loaded.as_ref().ok().and_then(|c| c.log_level.clone());
     let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let set_log_level = init_control_logging(level.as_deref(), events.clone())?;
     let backend = control::MacBackend { set_log_level };
-    let mut controller = control::Controller::new(backend, std::io::stdout(), path, events);
+    let mut controller = control::Controller::with_loaded(backend, std::io::stdout(), path, events, loaded);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let shutdown = async move {
         tokio::select! {
@@ -116,15 +115,12 @@ fn init_control_logging(
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    // sspi debug output can carry NTLM material: capped at warn.
-    let filter = |level: &str| {
-        tracing_subscriber::EnvFilter::new(level).add_directive("sspi=warn".parse().expect("static directive"))
-    };
-    let (filter_layer, reload) = tracing_subscriber::reload::Layer::new(filter(level.unwrap_or("info")));
-    let threshold = Arc::new(AtomicU8::new(control::level_rank(level.unwrap_or("warn"))));
+    // Unset means the app's default, "warn", for both the file and what is forwarded.
+    let level = level.unwrap_or(DEFAULT_CONTROL_LOG_LEVEL);
+    let (filter_layer, reload) = tracing_subscriber::reload::Layer::new(log_filter(level));
+    let threshold = Arc::new(AtomicU8::new(control::level_rank(level)));
 
-    let log_path = macrdp_core::log_bridge::default_log_dir()?.join("macrdp.log");
-    let log_file = macrdp_core::log_bridge::open_private_log(&log_path)?;
+    let (_, log_file) = open_log_file()?;
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(
@@ -135,7 +131,7 @@ fn init_control_logging(
         .with(control::LogForwarder { events, threshold: Arc::clone(&threshold) })
         .init();
     Ok(Box::new(move |level: &str| {
-        if let Err(e) = reload.modify(|f| *f = filter(level)) {
+        if let Err(e) = reload.modify(|f| *f = log_filter(level)) {
             tracing::warn!("Cannot change the log level: {e}");
         }
         threshold.store(control::level_rank(level), Ordering::Relaxed);
@@ -199,13 +195,11 @@ fn init_logging(level: &str) -> Result<PathBuf> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    // sspi debug output can carry NTLM material: capped at warn even under RUST_LOG.
+    // RUST_LOG wins; sspi stays capped either way.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level))
-        .add_directive("sspi=warn".parse()?);
-
-    let log_path = macrdp_core::log_bridge::default_log_dir()?.join("macrdp.log");
-    let log_file = macrdp_core::log_bridge::open_private_log(&log_path)?;
+        .add_directive(SSPI_CAP.parse()?);
+    let (log_path, log_file) = open_log_file()?;
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -219,9 +213,32 @@ fn init_logging(level: &str) -> Result<PathBuf> {
     Ok(log_path)
 }
 
+/// The app's log level picker defaults to "warn".
+const DEFAULT_CONTROL_LOG_LEVEL: &str = "warn";
+/// sspi debug output can carry NTLM material: capped at warn whatever the level.
+const SSPI_CAP: &str = "sspi=warn";
+
+fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::new(level).add_directive(SSPI_CAP.parse().expect("static directive"))
+}
+
+/// `~/Library/Logs/macrdp/macrdp.log` (dir 0700, file 0600, no symlinks).
+fn open_log_file() -> Result<(PathBuf, std::fs::File)> {
+    let log_path = macrdp_core::log_bridge::default_log_dir()?.join("macrdp.log");
+    let log_file = macrdp_core::log_bridge::open_private_log(&log_path)?;
+    Ok((log_path, log_file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rate_is_range_checked() {
+        assert!(Cli::try_parse_from(["macrdp-server", "--frame-rate", "0"]).is_err());
+        assert!(Cli::try_parse_from(["macrdp-server", "--frame-rate", "121"]).is_err());
+        assert_eq!(Cli::try_parse_from(["macrdp-server", "--frame-rate", "60"]).unwrap().frame_rate, Some(60));
+    }
 
     #[test]
     fn enroll_is_a_subcommand() {

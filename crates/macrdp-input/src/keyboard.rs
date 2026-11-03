@@ -1,12 +1,16 @@
 use anyhow::Result;
 use core_graphics::event::{CGEvent, CGKeyCode};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use crate::keymap::scancode_to_keycode;
 
 pub struct KeyboardInjector {
     surrogates: Mutex<SurrogateJoiner>,
+    /// Keycodes pressed by the client and not yet released, so a dropped session cannot
+    /// leave a modifier held on the Mac.
+    down: Mutex<BTreeSet<CGKeyCode>>,
 }
 
 impl KeyboardInjector {
@@ -16,6 +20,7 @@ impl KeyboardInjector {
             .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission"))?;
         Ok(Self {
             surrogates: Mutex::default(),
+            down: Mutex::default(),
         })
     }
 
@@ -34,13 +39,34 @@ impl KeyboardInjector {
             }
         };
 
-        let source = Self::source()?;
-        let event = CGEvent::new_keyboard_event(source, keycode as CGKeyCode, pressed)
-            .map_err(|_| anyhow::anyhow!("Failed to create keyboard event"))?;
-
-        crate::post(&event);
+        let keycode = keycode as CGKeyCode;
+        Self::post_key(keycode, pressed)?;
+        let mut down = self.down.lock().unwrap_or_else(|e| e.into_inner());
+        if pressed {
+            down.insert(keycode);
+        } else {
+            down.remove(&keycode);
+        }
         tracing::trace!(scancode, keycode, pressed, "Keyboard event injected");
         Ok(())
+    }
+
+    fn post_key(keycode: CGKeyCode, pressed: bool) -> Result<()> {
+        let event = CGEvent::new_keyboard_event(Self::source()?, keycode, pressed)
+            .map_err(|_| anyhow::anyhow!("Failed to create keyboard event"))?;
+        crate::post(&event);
+        Ok(())
+    }
+
+    /// Releases every key the client still holds (the session ended mid-press).
+    pub fn release_all(&self) {
+        let held = std::mem::take(&mut *self.down.lock().unwrap_or_else(|e| e.into_inner()));
+        for keycode in held {
+            if let Err(e) = Self::post_key(keycode, false) {
+                tracing::warn!(keycode, "Cannot release key: {e}");
+            }
+        }
+        *self.surrogates.lock().unwrap_or_else(|e| e.into_inner()) = SurrogateJoiner::default();
     }
 
     /// Inject one UTF-16 unit of a unicode key press/release.

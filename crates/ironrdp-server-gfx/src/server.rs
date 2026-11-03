@@ -114,11 +114,28 @@ fn spawn_mouse_worker(handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>) -> mp
         while let Some(event) = rx.blocking_recv() {
             handler.blocking_lock().mouse(event);
         }
+        // The session's channel is gone and every queued event applied: nothing can press
+        // a button after this release.
+        handler.blocking_lock().release_all();
     });
     tx
 }
 
 impl_as_any!(AInputHandler);
+
+/// Calls [`RdpServerInputHandler::release_all`] when dropped, also when the session future is
+/// cancelled (server stop). If the ainput mouse worker holds the handler lock, it is still
+/// draining this session's events and releases everything itself once its channel closes
+/// (see `spawn_mouse_worker`), so no late release can reach a replacing session.
+struct ReleaseInputOnDrop(Arc<Mutex<Box<dyn RdpServerInputHandler>>>);
+
+impl Drop for ReleaseInputOnDrop {
+    fn drop(&mut self) {
+        if let Ok(mut handler) = self.0.try_lock() {
+            handler.release_all();
+        }
+    }
+}
 
 impl dvc::DvcProcessor for AInputHandler {
     fn channel_name(&self) -> &str {
@@ -445,16 +462,19 @@ impl RdpServer {
             peer,
         } = hs;
 
-        // Reset GFX state for new connection, preserving peer IP and hot-updated resolution
+        // Reset per-connection GFX state. Settings survive the reset: the RemoteFX quality set
+        // at startup or hot-updated, and the "next connection" frame rate and cursor, which
+        // this connection's pipeline adopts once it starts.
         let pending_resolution = {
             let mut gs = self.gfx_state.lock().unwrap();
-            let w = gs.width;
-            let h = gs.height;
-            let avc444_enabled = gs.avc444_enabled;
-            let res = gs.resolution.take();
-            *gs = GfxState::new(w, h, avc444_enabled);
+            let fresh = GfxState::new(gs.width, gs.height, gs.avc444_enabled);
+            let old = std::mem::replace(&mut *gs, fresh);
             gs.peer_addr = Some(peer.ip());
-            res
+            gs.rfx_quality = old.rfx_quality;
+            gs.rfx_auto = old.rfx_auto;
+            gs.show_cursor = old.show_cursor;
+            gs.next_frame_rate = old.next_frame_rate;
+            old.resolution
         };
 
         // Apply hot-updated resolution for this new connection
@@ -521,6 +541,9 @@ impl RdpServer {
                 let peer = hs.peer;
                 // Dropped when this session ends, including when this future is cancelled.
                 let mut guard = self.session_lifecycle.as_ref().map(|l| l.session_started(peer));
+                // Likewise: a client that drops mid-press, or a server stopped mid-session,
+                // must not leave keys or buttons held.
+                let release_input = ReleaseInputOnDrop(Arc::clone(&self.handler));
                 {
                     let session = self.run_session(hs);
                     tokio::pin!(session);
@@ -546,8 +569,10 @@ impl RdpServer {
                     }
                 }
                 drop(guard);
-                info!("Ready for next connection");
+                // Close this session's channels first: the mouse worker then drains and exits.
                 self.static_channels = StaticChannelSet::new();
+                drop(release_input);
+                info!("Ready for next connection");
                 continue;
             }
 
@@ -1405,7 +1430,10 @@ const TLS_TIMEOUT: Duration = Duration::from_secs(3);
 /// CredSSP, generous because the client may wait on the user (certificate prompt).
 const CREDSSP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Handshakes in flight at once; when full, the oldest unauthenticated one is evicted.
+/// An evicted socket still not negotiated after this long counts as a failure.
+const IDLE_BEFORE_NEGOTIATION: Duration = Duration::from_secs(1);
+
+/// Handshakes in flight at once; when full, the least advanced evictable one is evicted.
 const MAX_HANDSHAKES: usize = 8;
 /// Handshakes in flight from one source IP; past it, that IP's oldest unauthenticated one is
 /// evicted (a client's idle probe must not refuse its next connection), else it is refused.
@@ -1419,12 +1447,35 @@ enum Admission {
     Refuse,
 }
 
+/// How far a handshake got. Eviction takes the least advanced one, so an attacker's idle
+/// sockets go before an owner who is answering the certificate prompt or being verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Stage {
+    /// TCP accepted, X.224 negotiation not finished.
+    Connected,
+    /// Negotiated NLA, TLS not finished.
+    Negotiated,
+    /// TLS up, CredSSP in progress.
+    Secured,
+    /// The authenticator is checking the password: never evicted.
+    Verifying,
+    /// Accepted, about to become the session: never evicted.
+    Authenticated,
+}
+
+impl Stage {
+    fn evictable(self) -> bool {
+        self < Self::Verifying
+    }
+}
+
 struct Slot {
     id: u64,
     ip: IpAddr,
-    /// Set once the authenticator accepted the client; such a handshake is never evicted.
-    authenticated: Rc<Cell<bool>>,
+    stage: Rc<Cell<Stage>>,
     abort: AbortHandle,
+    /// When the socket was accepted.
+    since: std::time::Instant,
 }
 
 /// Handshakes in flight, oldest first, so idle sockets cannot starve the owner.
@@ -1436,26 +1487,28 @@ struct HandshakeSlots {
 
 impl HandshakeSlots {
     fn admit(&self, ip: IpAddr) -> Admission {
-        let mut same_ip = self.slots.iter().filter(|s| s.ip == ip);
-        if same_ip.clone().count() >= MAX_HANDSHAKES_PER_IP {
-            return match same_ip.find(|s| !s.authenticated.get()) {
-                Some(oldest) => Admission::AcceptEvicting(oldest.id),
-                None => Admission::Refuse,
-            };
+        let same_ip = || self.slots.iter().filter(move |s| s.ip == ip);
+        if same_ip().count() >= MAX_HANDSHAKES_PER_IP {
+            return Self::evict_from(same_ip());
         }
         if self.slots.len() < MAX_HANDSHAKES {
             return Admission::Accept;
         }
-        match self.slots.iter().find(|s| !s.authenticated.get()) {
-            Some(oldest) => Admission::AcceptEvicting(oldest.id),
-            None => Admission::Refuse,
-        }
+        Self::evict_from(self.slots.iter())
     }
 
-    fn insert(&mut self, ip: IpAddr, authenticated: Rc<Cell<bool>>, abort: AbortHandle) -> u64 {
+    /// The least advanced evictable handshake, oldest first among equals.
+    fn evict_from<'a>(slots: impl Iterator<Item = &'a Slot>) -> Admission {
+        slots
+            .filter(|s| s.stage.get().evictable())
+            .min_by_key(|s| (s.stage.get(), s.id))
+            .map_or(Admission::Refuse, |s| Admission::AcceptEvicting(s.id))
+    }
+
+    fn insert(&mut self, ip: IpAddr, stage: Rc<Cell<Stage>>, abort: AbortHandle) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.slots.push(Slot { id, ip, authenticated, abort });
+        self.slots.push(Slot { id, ip, stage, abort, since: std::time::Instant::now() });
         id
     }
 
@@ -1506,20 +1559,29 @@ fn start_handshake(
     }
     if let Admission::AcceptEvicting(id) = admission {
         if let Some(evicted) = slots.remove(id) {
-            // Not a failure: the evicted socket may be the owner's.
-            info!(evicted = %evicted.ip, new = %peer, "Handshake slots busy, evicting the oldest unauthenticated one");
+            let stage = evicted.stage.get();
+            info!(evicted = %evicted.ip, ?stage, new = %peer, "Handshake slots busy, evicting the least advanced one");
             evicted.abort.abort();
+            // A socket that sat for a while without even finishing negotiation is charged like
+            // its timeout would have been, so holding slots open with idle connections earns
+            // backoff. A fresh one may be the owner's (negotiation takes milliseconds), and
+            // later stages may be too (the iOS spare connection, a certificate prompt).
+            if stage == Stage::Connected && evicted.since.elapsed() >= IDLE_BEFORE_NEGOTIATION {
+                let auth = Arc::clone(&ctx.auth);
+                let ip = evicted.ip;
+                drop(task::spawn_blocking(move || auth.handshake_failed(ip)));
+            }
         }
     }
     set_keepalive(&stream);
     if let Err(error) = stream.set_nodelay(true) {
         debug!(%error, "Failed to set TCP_NODELAY");
     }
-    let authenticated = Rc::new(Cell::new(false));
+    let stage = Rc::new(Cell::new(Stage::Connected));
     let ctx = Rc::clone(ctx);
-    let inner_authenticated = Rc::clone(&authenticated);
+    let inner_stage = Rc::clone(&stage);
     let (future, abort) = abortable(async move {
-        match handshake(&ctx, stream, peer, &inner_authenticated).await {
+        match handshake(&ctx, stream, peer, &inner_stage).await {
             Ok(hs) => Some(hs),
             Err(error) if error.is::<TlsIdle>() => {
                 debug!(%peer, "Client left a negotiated connection idle before TLS (spare connection)");
@@ -1531,7 +1593,7 @@ fn start_handshake(
             }
         }
     });
-    let id = slots.insert(peer.ip(), authenticated, abort);
+    let id = slots.insert(peer.ip(), stage, abort);
     handshakes.push(Box::pin(async move { (id, future.await.ok().flatten()) }));
 }
 
@@ -1559,18 +1621,20 @@ async fn report_handshake_failed(auth: &Arc<dyn RdpAuthenticator>, ip: IpAddr) {
 ///
 /// Each stage has its own timeout. Failures and timeouts before authentication are
 /// reported with `handshake_failed`, except an idle TLS stage ([`TlsIdle`]); a failed CredSSP exchange counts once as a
-/// credential failure. `authenticated` is set when the authenticator accepted the client.
+/// credential failure. `stage` tracks progress for slot eviction.
 async fn handshake(
     ctx: &HandshakeCtx,
     stream: TcpStream,
     peer: SocketAddr,
-    authenticated: &Rc<Cell<bool>>,
+    stage: &Rc<Cell<Stage>>,
 ) -> Result<Handshaked> {
     debug!(%peer, "Received connection");
     let auth = Arc::clone(&ctx.auth);
-    let identity = task::spawn_blocking(move || auth.ntlm_identity())
-        .await?
-        .context("no Mac account enrolled")?;
+    // Not a failure of the client's: the owner may simply connect before enrolling. The
+    // authenticator caches the answer, so repeated connects read no Keychain.
+    let Some(identity) = task::spawn_blocking(move || auth.ntlm_identity()).await? else {
+        bail!("no Mac account enrolled");
+    };
     let creds = ironrdp_acceptor::credssp::ntlm_hash_credentials(&identity.username, &identity.nt_hash);
     drop(identity);
 
@@ -1590,6 +1654,7 @@ async fn handshake(
         let BeginResult::ShouldUpgrade(stream) = begin else {
             bail!("client did not negotiate NLA");
         };
+        stage.set(Stage::Negotiated);
         tokio::time::timeout(TLS_TIMEOUT, ctx.tls.accept(stream))
             .await
             .map_err(|_| anyhow::Error::new(TlsIdle))?
@@ -1606,12 +1671,13 @@ async fn handshake(
     };
     let mut framed = TokioFramed::new(tls_stream);
     acceptor.mark_security_upgrade_as_done();
+    stage.set(Stage::Secured);
 
     let auth = Arc::clone(&ctx.auth);
     // authorize() records its own failure; CredSSP errors before it are recorded below.
     let authorize_ran = Rc::new(Cell::new(false));
     let authorize_ran_inner = Rc::clone(&authorize_ran);
-    let authenticated_inner = Rc::clone(authenticated);
+    let stage_inner = Rc::clone(stage);
     let mut network_client = ironrdp_tokio::reqwest::ReqwestNetworkClient::new();
     let credssp = ironrdp_acceptor::accept_credssp(
         &mut framed,
@@ -1622,12 +1688,14 @@ async fn handshake(
         None,
         |delegated| async move {
             authorize_ran_inner.set(true);
+            // Evicting now would drop a verified owner while OpenDirectory answers.
+            stage_inner.set(Stage::Verifying);
             let username = delegated.username.account_name().to_owned();
             let domain = delegated.username.domain_name().unwrap_or_default().to_owned();
             let ok = task::spawn_blocking(move || auth.authorize(peer_ip, &username, &domain, delegated.password.as_ref()))
                 .await
                 .unwrap_or(false);
-            authenticated_inner.set(ok);
+            stage_inner.set(if ok { Stage::Authenticated } else { Stage::Secured });
             ok
         },
     );
@@ -1768,10 +1836,10 @@ mod tests {
         IpAddr::from([192, 0, 2, n])
     }
 
-    fn occupy(slots: &mut HandshakeSlots, ip: IpAddr) -> (u64, Rc<Cell<bool>>) {
-        let authenticated = Rc::new(Cell::new(false));
-        let id = slots.insert(ip, Rc::clone(&authenticated), AbortHandle::new_pair().0);
-        (id, authenticated)
+    fn occupy(slots: &mut HandshakeSlots, ip: IpAddr) -> (u64, Rc<Cell<Stage>>) {
+        let stage = Rc::new(Cell::new(Stage::Connected));
+        let id = slots.insert(ip, Rc::clone(&stage), AbortHandle::new_pair().0);
+        (id, stage)
     }
 
     #[test]
@@ -1787,8 +1855,8 @@ mod tests {
     #[test]
     fn a_full_ip_of_authenticated_handshakes_refuses() {
         let mut slots = HandshakeSlots::default();
-        occupy(&mut slots, slot_ip(1)).1.set(true);
-        occupy(&mut slots, slot_ip(1)).1.set(true);
+        occupy(&mut slots, slot_ip(1)).1.set(Stage::Authenticated);
+        occupy(&mut slots, slot_ip(1)).1.set(Stage::Authenticated);
         assert_eq!(slots.admit(slot_ip(1)), Admission::Refuse);
     }
 
@@ -1800,15 +1868,34 @@ mod tests {
             ids.push(occupy(&mut slots, slot_ip(u8::try_from(n / 2).expect("small"))));
         }
         // The oldest one already authenticated: it is about to become the session.
-        ids[0].1.set(true);
+        ids[0].1.set(Stage::Authenticated);
         assert_eq!(slots.admit(slot_ip(100)), Admission::AcceptEvicting(ids[1].0));
+    }
+
+    #[test]
+    fn eviction_takes_the_least_advanced_handshake() {
+        let mut slots = HandshakeSlots::default();
+        let mut ids = Vec::new();
+        for n in 0..MAX_HANDSHAKES {
+            let slot = occupy(&mut slots, slot_ip(u8::try_from(n / 2).expect("small")));
+            slot.1.set(Stage::Secured);
+            ids.push(slot);
+        }
+        // The owner in CredSSP (oldest) outlives a newer socket stuck before negotiation.
+        ids[5].1.set(Stage::Connected);
+        assert_eq!(slots.admit(slot_ip(100)), Admission::AcceptEvicting(ids[5].0));
+        // A handshake being verified is never evicted.
+        for slot in &ids {
+            slot.1.set(Stage::Verifying);
+        }
+        assert_eq!(slots.admit(slot_ip(100)), Admission::Refuse);
     }
 
     #[test]
     fn full_slots_of_authenticated_handshakes_refuse() {
         let mut slots = HandshakeSlots::default();
         for n in 0..MAX_HANDSHAKES {
-            occupy(&mut slots, slot_ip(u8::try_from(n / 2).expect("small"))).1.set(true);
+            occupy(&mut slots, slot_ip(u8::try_from(n / 2).expect("small"))).1.set(Stage::Authenticated);
         }
         assert_eq!(slots.admit(slot_ip(100)), Admission::Refuse);
     }

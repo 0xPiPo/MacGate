@@ -123,6 +123,18 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A source with no failure for this long starts again from zero.
 const BACKOFF_FORGET: Duration = Duration::from_secs(15 * 60);
+/// Sources tracked at once; past this the least-blocked one is forgotten, so rotating
+/// addresses cannot grow the map without bound.
+const MAX_BACKOFF_SOURCES: usize = 4096;
+
+/// The backoff bucket for `ip`: an IPv6 host controls its whole /64, so that is one source
+/// (otherwise every rotated address gets fresh free guesses and a new map entry).
+fn backoff_source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+        v4 => v4,
+    }
+}
 /// Credential failures from all sources within `GLOBAL_WINDOW` above which every source is
 /// slowed down: a /24 cannot parallelise guesses past this budget.
 const GLOBAL_BUDGET: usize = 20;
@@ -157,6 +169,7 @@ impl Backoff {
     /// True when `ip` may start a handshake at `now`. Over the global budget this uses up
     /// the single admission of the current `GLOBAL_SPACING` interval.
     pub fn admit(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let ip = backoff_source(ip);
         if self.entries.get(&ip).is_some_and(|e| now < e.blocked_until) {
             return false;
         }
@@ -171,8 +184,14 @@ impl Backoff {
     }
 
     pub fn record_failure(&mut self, ip: IpAddr, now: Instant, kind: FailureKind) {
-        // Drop sources that have been quiet long enough; this also bounds the map.
+        let ip = backoff_source(ip);
+        // Drop sources that have been quiet long enough, then cap what is left.
         self.entries.retain(|_, e| now < e.blocked_until + BACKOFF_FORGET);
+        if self.entries.len() >= MAX_BACKOFF_SOURCES && !self.entries.contains_key(&ip) {
+            if let Some(oldest) = self.entries.iter().min_by_key(|(_, e)| e.blocked_until).map(|(k, _)| *k) {
+                self.entries.remove(&oldest);
+            }
+        }
         let entry = self.entries.entry(ip).or_insert(BackoffEntry { failures: 0, blocked_until: now });
         entry.failures = entry.failures.saturating_add(1);
         let delay = match entry.failures.checked_sub(FREE_FAILURES + 1) {
@@ -187,7 +206,7 @@ impl Backoff {
     }
 
     pub fn record_success(&mut self, ip: IpAddr) {
-        self.entries.remove(&ip);
+        self.entries.remove(&backoff_source(ip));
     }
 
     fn prune_global(&mut self, now: Instant) {
@@ -197,10 +216,23 @@ impl Backoff {
     }
 }
 
+/// How long "not enrolled" (or an unreadable Keychain) is remembered, so a stream of
+/// connects reads the Keychain and logs at most once per interval.
+const NEGATIVE_CACHE: Duration = Duration::from_secs(10);
+/// A failed login drops an enrollment cached at least this long ago, so a re-enroll made by
+/// another process (`macrdp-server enroll`) is picked up without a restart.
+const RELOAD_AFTER_FAILURE: Duration = Duration::from_secs(5);
+
 struct CachedEnrollment {
     /// The [`ENROLL_EPOCH`] value the enrollment was loaded at.
     epoch: u64,
-    enrollment: Enrollment,
+    loaded: Instant,
+    /// `None`: nothing enrolled, or the Keychain could not be read.
+    enrollment: Option<Enrollment>,
+    /// A failed login asked for a re-read; the enrollment stays usable until one succeeds.
+    stale: bool,
+    /// A re-read is running (outside the lock); others keep using this enrollment meanwhile.
+    reloading: bool,
 }
 
 /// The server's [`RdpAuthenticator`]: only `user`, with the enrolled hash and the current
@@ -211,6 +243,8 @@ pub struct MacAuthenticator {
     store: Arc<dyn AccountStore>,
     backoff: Mutex<Backoff>,
     cache: Mutex<Option<CachedEnrollment>>,
+    /// See [`RELOAD_AFTER_FAILURE`].
+    reload_after_failure: Duration,
     reenroll: &'static AtomicBool,
     epoch: &'static AtomicU64,
     /// Config `auto_unlock`: where an accepted password waits for a locked session's first frame.
@@ -233,7 +267,17 @@ impl MacAuthenticator {
         reenroll: &'static AtomicBool,
         epoch: &'static AtomicU64,
     ) -> Self {
-        Self { user, host_names, store, backoff: Mutex::default(), cache: Mutex::default(), reenroll, epoch, unlock: None }
+        Self {
+            user,
+            host_names,
+            store,
+            backoff: Mutex::default(),
+            cache: Mutex::default(),
+            reload_after_failure: RELOAD_AFTER_FAILURE,
+            reenroll,
+            epoch,
+            unlock: None,
+        }
     }
 
     /// Config `auto_unlock`: keep an accepted password briefly so a session that starts on the
@@ -253,27 +297,62 @@ impl MacAuthenticator {
         true
     }
 
-    /// The cached enrollment; reloaded only when nothing is cached or after an enroll.
+    /// The cached enrollment; reloaded after an enroll in this process, after a failed login
+    /// (see [`RELOAD_AFTER_FAILURE`]), or once [`NEGATIVE_CACHE`] passes while none was found.
     fn enrollment(&self) -> Option<Enrollment> {
         let epoch = self.epoch.load(Ordering::Acquire);
-        let mut cache = lock(&self.cache);
-        if let Some(cached) = cache.as_ref().filter(|c| c.epoch == epoch) {
-            return Some(cached.enrollment.clone());
-        }
-        match self.store.load_hash(&self.user) {
-            Ok(Some(enrollment)) => {
-                *cache = Some(CachedEnrollment { epoch, enrollment: enrollment.clone() });
-                Some(enrollment)
+        let previous = {
+            let mut cache = lock(&self.cache);
+            match cache.as_mut().filter(|c| c.epoch == epoch) {
+                Some(cached) => {
+                    let fresh = match cached.enrollment {
+                        Some(_) => !cached.stale,
+                        None => cached.loaded.elapsed() < NEGATIVE_CACHE,
+                    };
+                    // One re-read at a time: it can block on a Keychain access prompt.
+                    if fresh || cached.reloading {
+                        return cached.enrollment.clone();
+                    }
+                    cached.reloading = true;
+                    cached.enrollment.clone()
+                }
+                None => None,
             }
+        };
+        // Read without holding the cache lock, so a slow Keychain never blocks other logins.
+        // A re-read that fails (Keychain locked, access prompt refused) keeps the enrollment
+        // already in hand: the owner must not be locked out by a stale-check.
+        let enrollment = match self.store.load_hash(&self.user) {
+            Ok(Some(enrollment)) => Some(enrollment),
             Ok(None) => {
-                *cache = None;
                 tracing::warn!(user = %self.user, "Refused: no Mac password enrolled");
                 None
+            }
+            Err(e) if previous.is_some() => {
+                tracing::warn!("Cannot re-read the enrolled hash, keeping the loaded one: {e:#}");
+                previous
             }
             Err(e) => {
                 tracing::error!("Refused: cannot read the enrolled hash: {e:#}");
                 None
             }
+        };
+        *lock(&self.cache) = Some(CachedEnrollment {
+            epoch,
+            loaded: Instant::now(),
+            enrollment: enrollment.clone(),
+            stale: false,
+            reloading: false,
+        });
+        enrollment
+    }
+
+    /// After a failed login: mark an enrollment that has been cached a while for a re-read
+    /// on the next connect (at most once per [`RELOAD_AFTER_FAILURE`]).
+    fn drop_stale_enrollment(&self) {
+        let mut cache = lock(&self.cache);
+        if let Some(cached) = cache.as_mut().filter(|c| c.loaded.elapsed() >= self.reload_after_failure) {
+            cached.stale = true;
         }
     }
 
@@ -342,9 +421,13 @@ impl RdpAuthenticator for MacAuthenticator {
                 unlock.stash(password, crate::unlock::HOLD);
             }
             lock(&self.backoff).record_success(peer);
+            // The hash matched and OpenDirectory accepted the password: the enrollment is
+            // current, even if it came from `macrdp-server enroll` in another process.
+            self.reenroll.store(false, Ordering::Relaxed);
             tracing::info!(%peer, user = %self.user, "Authenticated with the Mac account");
         } else {
             self.record_failure(peer, FailureKind::Credential);
+            self.drop_stale_enrollment();
         }
         ok
     }
@@ -352,8 +435,9 @@ impl RdpAuthenticator for MacAuthenticator {
     fn auth_failed(&self, peer: IpAddr) {
         tracing::warn!(%peer, "NLA authentication failed (wrong user or password)");
         self.record_failure(peer, FailureKind::Credential);
-        let stored = lock(&self.cache).as_ref().and_then(|c| c.enrollment.password_set);
+        let stored = lock(&self.cache).as_ref().and_then(|c| c.enrollment.as_ref()?.password_set);
         self.check_password_stamp(stored);
+        self.drop_stale_enrollment();
     }
 
     fn handshake_failed(&self, peer: IpAddr) {
@@ -608,11 +692,22 @@ mod tests {
         hashes: Mutex<HashMap<String, Enrollment>>,
         loads: AtomicUsize,
         od_stamp: Mutex<Option<f64>>,
+        failing_loads: std::sync::atomic::AtomicBool,
     }
 
     impl FakeStore {
         fn new(password: &str) -> Self {
-            Self { password: password.into(), hashes: Mutex::default(), loads: AtomicUsize::new(0), od_stamp: Mutex::new(Some(100.0)) }
+            Self {
+                password: password.into(),
+                hashes: Mutex::default(),
+                loads: AtomicUsize::new(0),
+                od_stamp: Mutex::new(Some(100.0)),
+                failing_loads: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        /// Keychain reads fail (locked keychain, refused access prompt).
+        fn fail_loads(&self, fail: bool) {
+            self.failing_loads.store(fail, Ordering::Relaxed);
         }
         fn hash(&self, user: &str) -> Option<[u8; 16]> {
             self.hashes.lock().unwrap().get(user).map(|e| *e.nt_hash)
@@ -631,6 +726,9 @@ mod tests {
         }
         fn load_hash(&self, user: &str) -> Result<Option<Enrollment>> {
             self.loads.fetch_add(1, Ordering::Relaxed);
+            if self.failing_loads.load(Ordering::Relaxed) {
+                anyhow::bail!("keychain locked");
+            }
             Ok(self.hashes.lock().unwrap().get(user).cloned())
         }
         fn store_hash(&self, user: &str, enrollment: &Enrollment) -> Result<()> {
@@ -750,6 +848,8 @@ mod tests {
         let f = fixture_with(FakeStore::new("hunter2"));
         assert!(f.auth.ntlm_identity().is_none());
         enroll(f.store.as_ref(), "pipo", "hunter2").unwrap();
+        // An enroll in this process bumps the epoch (the fixture has its own counter).
+        f.epoch.fetch_add(1, Ordering::AcqRel);
         let id = f.auth.ntlm_identity().unwrap();
         assert_eq!(id.username, "pipo");
         assert_eq!(*id.nt_hash, *nt_hash("hunter2"));
@@ -780,11 +880,38 @@ mod tests {
     }
 
     #[test]
-    fn ntlm_identity_retries_while_not_enrolled() {
+    fn not_enrolled_is_cached_so_connects_do_not_read_the_keychain() {
         let f = fixture_with(FakeStore::new("hunter2"));
         assert!(f.auth.ntlm_identity().is_none());
         assert!(f.auth.ntlm_identity().is_none());
-        assert_eq!(f.store.loads(), 2);
+        assert_eq!(f.store.loads(), 1);
+    }
+
+    #[test]
+    fn a_failed_reread_keeps_the_loaded_enrollment() {
+        let store = FakeStore::new("hunter2");
+        enroll(&store, "pipo", "hunter2").unwrap();
+        let mut f = fixture_with(store);
+        f.auth.reload_after_failure = Duration::ZERO;
+        f.auth.ntlm_identity().unwrap();
+        f.store.fail_loads(true);
+        f.auth.auth_failed(ip());
+        assert_eq!(*f.auth.ntlm_identity().expect("still enrolled").nt_hash, *nt_hash("hunter2"));
+    }
+
+    #[test]
+    fn failed_login_picks_up_an_enroll_from_another_process() {
+        let store = FakeStore::new("hunter2");
+        enroll(&store, "pipo", "hunter2").unwrap();
+        let mut f = fixture_with(store);
+        f.auth.reload_after_failure = Duration::ZERO;
+        f.auth.ntlm_identity().unwrap();
+        // `macrdp-server enroll` rewrote the Keychain; this process's epoch did not move.
+        let other = Enrollment { nt_hash: nt_hash("new-pass"), password_set: None };
+        f.store.store_hash("pipo", &other).unwrap();
+        assert_eq!(*f.auth.ntlm_identity().unwrap().nt_hash, *nt_hash("hunter2"), "still cached");
+        f.auth.auth_failed(ip());
+        assert_eq!(*f.auth.ntlm_identity().unwrap().nt_hash, *nt_hash("new-pass"));
     }
 
     #[test]
@@ -876,6 +1003,9 @@ mod tests {
         // CredSSP matched the stored hash, but OpenDirectory now has a new password.
         assert!(!auth.authorize(ip(), "pipo", "", "old-password"));
         assert!(flag.load(Ordering::Relaxed));
+        // Re-enrolled elsewhere (CLI): the next good login clears the prompt.
+        assert!(auth.authorize(ip(), "pipo", "", "hunter2"));
+        assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -913,6 +1043,22 @@ mod tests {
 
     fn nth_ip(n: usize) -> IpAddr {
         IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + u32::try_from(n).unwrap()))
+    }
+
+    #[test]
+    fn ipv6_backoff_is_per_64_and_the_map_is_capped() {
+        let mut b = Backoff::default();
+        let t0 = Instant::now();
+        let v6 = |host: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, host));
+        for host in 0..=FREE_FAILURES as u16 {
+            b.record_failure(v6(host), t0, FailureKind::Protocol);
+        }
+        assert!(!b.admit(v6(999), t0), "a new address in the same /64 is still blocked");
+
+        for n in 0..MAX_BACKOFF_SOURCES + 100 {
+            b.record_failure(nth_ip(n), t0, FailureKind::Protocol);
+        }
+        assert!(b.entries.len() <= MAX_BACKOFF_SOURCES);
     }
 
     #[test]

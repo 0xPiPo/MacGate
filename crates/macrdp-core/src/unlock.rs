@@ -157,6 +157,13 @@ pub(crate) fn first_frame_sent() {
     if !PENDING.slot().armed {
         return;
     }
+    // Someone at the Mac may have unlocked it since the session armed this: typing the
+    // password then would send it, plus Return, into whatever app has focus.
+    if !screen_locked() {
+        PENDING.clear();
+        tracing::info!("Auto-unlock skipped: the screen is no longer locked");
+        return;
+    }
     match KeyboardInjector::new() {
         Ok(keys) => {
             unlock_with(&PENDING, &keys);

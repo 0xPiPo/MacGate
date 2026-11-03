@@ -64,24 +64,39 @@ impl Yuv420Frame {
 /// U = (-43*R -  85*G + 128*B) >> 8 + 128
 /// V = (128*R - 107*G -  21*B) >> 8 + 128
 /// ```
+///
+/// The planes are laid out with `dst_stride` bytes per row: the encoder's (16-aligned) width,
+/// which the split below reads with. A frame larger than the planes or shorter than its
+/// declared size is an error, not a panic.
+#[allow(clippy::too_many_arguments)]
 pub fn bgra_to_yuv444(
     bgra: &[u8],
     width: u32,
     height: u32,
     stride: usize,
+    dst_stride: usize,
     y444: &mut [u8],
     u444: &mut [u8],
     v444: &mut [u8],
-) {
+) -> anyhow::Result<()> {
     let w = width as usize;
     let h = height as usize;
-    debug_assert!(y444.len() >= w * h);
-    debug_assert!(u444.len() >= w * h);
-    debug_assert!(v444.len() >= w * h);
+    if h == 0 || w == 0 {
+        return Ok(());
+    }
+    let plane = dst_stride * h;
+    anyhow::ensure!(
+        w <= dst_stride && y444.len() >= plane && u444.len() >= plane && v444.len() >= plane,
+        "frame {width}x{height} larger than the {dst_stride}-wide YUV444 planes"
+    );
+    anyhow::ensure!(
+        stride >= w * 4 && bgra.len() >= (h - 1) * stride + w * 4,
+        "BGRA buffer too short for {width}x{height} at stride {stride}"
+    );
 
     for row in 0..h {
         let bgra_row = row * stride;
-        let yuv_row = row * w;
+        let yuv_row = row * dst_stride;
         for col in 0..w {
             let px = bgra_row + col * 4;
             let b = bgra[px] as i32;
@@ -99,6 +114,7 @@ pub fn bgra_to_yuv444(
             v444[idx] = v.clamp(0, 255) as u8;
         }
     }
+    Ok(())
 }
 
 /// Split YUV444 planes into Main View (standard YUV420) and Auxiliary View
@@ -132,7 +148,7 @@ pub fn yuv444_split_to_yuv420(
     let half_w = w / 2;
     let half_h = h / 2;
 
-    debug_assert!(w % 2 == 0 && h % 2 == 0, "width and height must be even");
+    debug_assert!(w.is_multiple_of(2) && h.is_multiple_of(2), "width and height must be even");
     debug_assert!(main_view.y.len() >= w * h);
     debug_assert!(main_view.u.len() >= half_w * half_h);
     debug_assert!(aux_view.y.len() >= w * h);
@@ -246,7 +262,7 @@ mod tests {
         let mut u444 = vec![0u8; size];
         let mut v444 = vec![0u8; size];
 
-        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, &mut y444, &mut u444, &mut v444);
+        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, w as usize, &mut y444, &mut u444, &mut v444).unwrap();
 
         let (exp_y, exp_u, exp_v) = ref_bt601(200, 100, 50);
         for i in 0..size {
@@ -277,7 +293,7 @@ mod tests {
         let mut u444 = vec![0u8; size];
         let mut v444 = vec![0u8; size];
 
-        bgra_to_yuv444(&bgra, w, h, stride, &mut y444, &mut u444, &mut v444);
+        bgra_to_yuv444(&bgra, w, h, stride, w as usize, &mut y444, &mut u444, &mut v444).unwrap();
 
         let (exp_y, exp_u, exp_v) = ref_bt601(90, 60, 30);
         for i in 0..size {
@@ -501,7 +517,7 @@ mod tests {
         let mut y444 = vec![0u8; size];
         let mut u444 = vec![0u8; size];
         let mut v444 = vec![0u8; size];
-        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, &mut y444, &mut u444, &mut v444);
+        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, w as usize, &mut y444, &mut u444, &mut v444).unwrap();
 
         let mut main_view = Yuv420Frame::new(w, h);
         let mut aux_view = Yuv420Frame::new(w, h);
@@ -520,5 +536,20 @@ mod tests {
         // B6/B7: picking any column from uniform data = same value
         assert!(aux_view.u.iter().all(|&v| v == exp_u), "uniform B6 check");
         assert!(aux_view.v.iter().all(|&v| v == exp_v), "uniform B7 check");
+    }
+
+    #[test]
+    fn yuv444_rows_use_the_encoder_stride() {
+        // 18 px wide frame in a 32-wide (16-aligned) encoder: row 1 must start at 32, not 18.
+        let (w, h, enc_w) = (18u32, 2u32, 32usize);
+        let bgra: Vec<u8> = (0..w * h).flat_map(|i| [0u8, 0, if i >= w { 255 } else { 0 }, 255]).collect();
+        let (mut y, mut u, mut v) = (vec![7u8; enc_w * 2], vec![0u8; enc_w * 2], vec![0u8; enc_w * 2]);
+        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, enc_w, &mut y, &mut u, &mut v).unwrap();
+        assert_eq!(y[0], 0);
+        assert!(y[enc_w] > 0, "row 1 starts at the encoder stride");
+        assert_eq!(y[w as usize], 7, "padding untouched");
+        // Larger than the planes, or a short buffer: an error, not a panic.
+        assert!(bgra_to_yuv444(&bgra, 40, h, 160, enc_w, &mut y, &mut u, &mut v).is_err());
+        assert!(bgra_to_yuv444(&bgra[..10], w, h, (w * 4) as usize, enc_w, &mut y, &mut u, &mut v).is_err());
     }
 }

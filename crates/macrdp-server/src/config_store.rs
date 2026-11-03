@@ -5,10 +5,9 @@ use std::path::{Path, PathBuf};
 use macrdp_core::{ConfigUpdate, ServerConfig};
 use serde_json::Value;
 
-/// `~/Library/Application Support/macrdp/config.toml`.
-pub fn default_path() -> anyhow::Result<PathBuf> {
-    let dir = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("no Application Support directory"))?;
-    Ok(dir.join("macrdp").join("config.toml"))
+/// The same file the command line reads: see [`macrdp_core::config_dir`].
+pub fn default_path() -> PathBuf {
+    macrdp_core::config_dir().join("config.toml")
 }
 
 /// The config at `path`; defaults when the file does not exist.

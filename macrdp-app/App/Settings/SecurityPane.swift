@@ -3,8 +3,13 @@ import SwiftUI
 
 struct SecurityPane: View {
     @Environment(HelperClient.self) private var client
-    @State private var port: Int?
+    /// Text, not a formatted number: the binding updates on every keystroke, so saving on
+    /// focus loss always sees what was typed.
+    @State private var port = ""
     @State private var bindAddress = ""
+    @FocusState private var editing: NetworkField?
+
+    private enum NetworkField { case port, bindAddress }
 
     private static let idleChoices = [0, 300, 900, 1800, 3600, 7200, 14400]
 
@@ -42,9 +47,11 @@ struct SecurityPane: View {
             }
 
             Section("Network") {
-                TextField("Port", value: $port, format: .number.grouping(.never))
+                TextField("Port", text: $port, prompt: Text("3389"))
+                    .focused($editing, equals: .port)
                     .onSubmit(commitPort)
                 TextField("Listen address", text: $bindAddress, prompt: Text("0.0.0.0"))
+                    .focused($editing, equals: .bindAddress)
                     .onSubmit(commitBindAddress)
                 Picker("Disconnect when idle for", selection: client.binding("idle_timeout_secs", default: 1800)) {
                     let current = client.config["idle_timeout_secs"]?.intValue ?? 1800
@@ -55,26 +62,60 @@ struct SecurityPane: View {
                 }
             }
         }
-        .onAppear(perform: loadDrafts)
-        .onChange(of: client.config) { loadDrafts() }
+        .onAppear {
+            loadPort()
+            loadBindAddress()
+        }
+        // Only the field whose value changed reloads, and never while it is being edited, so
+        // toggling another setting does not throw away an unsaved draft.
+        .onChange(of: client.config["port"]) { if editing != .port { loadPort() } }
+        .onChange(of: client.config["bind_address"]) { if editing != .bindAddress { loadBindAddress() } }
+        // Leaving a field saves it, like pressing Return.
+        .onChange(of: editing) { previous, _ in
+            switch previous {
+            case .port: commitPort()
+            case .bindAddress: commitBindAddress()
+            case nil: break
+            }
+        }
     }
 
-    private func loadDrafts() {
-        port = client.config["port"]?.intValue ?? 3389
+    private func loadPort() {
+        port = String(client.config["port"]?.intValue ?? 3389)
+    }
+
+    private func loadBindAddress() {
         bindAddress = client.config["bind_address"]?.stringValue ?? "0.0.0.0"
     }
 
     private func commitPort() {
-        guard let port, (1024...65535).contains(port) else {
+        guard let value = Int(port.trimmingCharacters(in: .whitespaces)), (1024...65535).contains(value) else {
             client.commandError = "The port must be between 1024 and 65535."
-            return loadDrafts()
+            return loadPort()
         }
-        client.perform { try await client.setConfig("port", .int(port)) }
+        guard value != client.config["port"]?.intValue else { return }
+        save("port", .int(value), reload: loadPort)
     }
 
     private func commitBindAddress() {
-        let address = bindAddress.trimmingCharacters(in: .whitespaces)
-        client.perform { try await client.setConfig("bind_address", .string(address.isEmpty ? "0.0.0.0" : address)) }
+        let trimmed = bindAddress.trimmingCharacters(in: .whitespaces)
+        let address = trimmed.isEmpty ? "0.0.0.0" : trimmed
+        guard address != client.config["bind_address"]?.stringValue else { return }
+        save("bind_address", .string(address), reload: loadBindAddress)
+    }
+
+    /// Saves one field; a rejected value is replaced by the saved one, so it is neither
+    /// left showing nor sent again when the field loses focus.
+    private func save(_ key: String, _ value: JSONValue, reload: @escaping () -> Void) {
+        Task {
+            do {
+                try await client.setConfig(key, value)
+                client.commandError = nil
+            } catch {
+                client.commandError = error.localizedDescription
+                reload()
+            }
+        }
     }
 }
 
